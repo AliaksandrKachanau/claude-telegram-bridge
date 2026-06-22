@@ -6,6 +6,7 @@ or via run_bot.bat.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sys
@@ -73,25 +74,43 @@ def main() -> None:
             f"⚙️ Режим: {settings.default_mode}\n"
             f"⏸ Пауза: {'да (до /resume)' if start_paused else 'нет'}\n"
             "\n"
-            "Команды: /ask /task /new /diff /git /project /mode /cancel "
-            "/note /pause /resume /status\n"
+            "Команды: /ask /task /new /diff /git /project /mode /cancel /pause "
+            "/resume /note /confirm /draft /reply_voice /status\n"
             "/help — подробная справка"
         )
 
+    _health_tasks: set = set()  # keep refs so background health tasks aren't GC'd
+
     async def _post_init(application) -> None:
-        # First thing the owner sees after a (re)start: status + command cheatsheet +
-        # live server connectivity. Pending updates are dropped below (drop_pending_updates),
+        # First thing the owner sees after a (re)start: status + command cheatsheet.
+        # Sent IMMEDIATELY. Do NOT await health.check_all() here — it probes 4 servers
+        # (Telegram/Claude/Groq/Edge) in parallel but blocks on the slowest, which on a
+        # slow link delays the "bot is up" notice AND the start of polling by up to ~5s.
+        # Connectivity is sent as a SECOND message from a background task, and is always
+        # available in /status. Pending updates are dropped below (drop_pending_updates),
         # so queued messages that piled up while the bot was down are NOT replayed.
         text = _startup_text()
-        try:
-            text += "\n\n" + "\n".join(H.render(await H.check_all(settings)))
-        except Exception as e:  # noqa: BLE001
-            log.warning("health check failed: %s", e)
         for uid in settings.allowed_user_ids:
             try:
                 await application.bot.send_message(chat_id=uid, text=text)
             except Exception as e:  # noqa: BLE001
                 log.warning("startup notify to %s failed: %s", uid, e)
+        # Health in the background: never delays the startup notice or command readiness.
+        t = asyncio.create_task(_send_health(application, settings))
+        _health_tasks.add(t)
+        t.add_done_callback(_health_tasks.discard)
+
+    async def _send_health(application, settings) -> None:
+        try:
+            srv_lines = H.render(await H.check_all(settings))
+        except Exception as e:  # noqa: BLE001
+            log.warning("health check failed: %s", e)
+            return
+        for uid in settings.allowed_user_ids:
+            try:
+                await application.bot.send_message(chat_id=uid, text="\n".join(srv_lines))
+            except Exception as e:  # noqa: BLE001
+                log.warning("health notify to %s failed: %s", uid, e)
 
     auth = authorized(settings)
     app = Application.builder().token(settings.token).post_init(_post_init).build()
@@ -110,11 +129,22 @@ def main() -> None:
     app.add_handler(CommandHandler("status", auth(C.cmd_status)))
     app.add_handler(CommandHandler("speak", auth(C.cmd_speak)))
     app.add_handler(CommandHandler("voice", auth(C.cmd_voice_mode)))
+    app.add_handler(CommandHandler("confirm", auth(C.cmd_confirm)))
+    app.add_handler(CommandHandler("draft", auth(C.cmd_draft)))
+    app.add_handler(CommandHandler("reply_voice", auth(C.cmd_reply_voice)))
     app.add_handler(CommandHandler("note", auth(C.cmd_note)))
     app.add_handler(CommandHandler("pause", auth(C.cmd_pause)))
     app.add_handler(CommandHandler("resume", auth(C.cmd_resume)))
     # Inline buttons for /note browse (callback_data starts with "nb:").
     app.add_handler(CallbackQueryHandler(auth(C.note_callback), pattern=r"^nb:"))
+    # Inline buttons for paginated answers (callback_data starts with "pg:").
+    app.add_handler(CallbackQueryHandler(auth(C.page_callback), pattern=r"^pg:"))
+    # Inline buttons for voice-triggered /mode full confirm (callback_data "mc:full"|"mc:no").
+    app.add_handler(CallbackQueryHandler(auth(C.mode_callback), pattern=r"^mc:"))
+    # Inline buttons for voice-confirm gate (callback_data "vc:send|edit|cancel").
+    app.add_handler(CallbackQueryHandler(auth(C.voice_confirm_callback), pattern=r"^vc:"))
+    # Inline buttons for voice draft (callback_data "dr:send|clear").
+    app.add_handler(CallbackQueryHandler(auth(C.draft_callback), pattern=r"^dr:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, auth(C.cmd_freetext)))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, auth(C.cmd_voice)))
 

@@ -18,6 +18,9 @@ from config import SESSIONS_PATH, Project, Settings
 
 log = logging.getLogger(__name__)
 
+# How many bot messages per chat to keep text for, so reply-voice can speak them.
+_BOT_TEXT_MAX = 50
+
 
 @dataclass
 class RunningTask:
@@ -40,6 +43,18 @@ class BrowseCache:
     files: list[str] = field(default_factory=list)    # last shown file dates ('YYYY-MM-DD')
 
 
+@dataclass
+class Pages:
+    """Active pagination for a multi-page Claude answer (per chat, in memory).
+
+    ``pg:<i>`` callback buttons reference an index into ``pages``; the cache is
+    replaced wholesale whenever a new multi-page answer is rendered, so a stale
+    button on an old message just yields an out-of-range -> friendly alert.
+    """
+    pages: list[str] = field(default_factory=list)
+    index: int = 0
+
+
 class State:
     def __init__(self, settings: Settings, start_paused: bool = False) -> None:
         self.settings = settings
@@ -53,6 +68,14 @@ class State:
         self.note_mode: dict[int, bool] = {}        # chat_id -> dictation mode on (voice->file, no Claude)
         self.note_folder: dict[int, str] = {}       # chat_id -> current dictation category folder
         self.note_browse: dict[int, BrowseCache] = {}  # chat_id -> /note browse inline-nav cache
+        self.page_cache: dict[int, Pages] = {}  # chat_id -> active multi-page answer (◀️/▶️)
+        self.confirm_voice: dict[int, bool] = {}  # chat_id -> confirm STT before sending (absent = ON)
+        self.pending_voice: dict[int, tuple[str, bool]] = {}  # chat_id -> (prompt, speak_reply) awaiting ✅/✏️/🗑
+        self.await_edit: dict[int, bool] = {}  # chat_id -> next text message replaces the pending prompt
+        self.draft_mode: dict[int, bool] = {}  # chat_id -> accumulate voice into a draft (absent = OFF)
+        self.draft: dict[int, list[str]] = {}  # chat_id -> accumulated voice fragments
+        self.reply_voice: dict[int, bool] = {}  # chat_id -> reply-to-speak (absent = OFF)
+        self.bot_text: dict[int, dict[int, str]] = {}  # chat_id -> {bot_message_id: plain_text} (for reply-voice)
         # Chat ids that start PAUSED. Only set when the bot is launched via autostart
         # (which exports BOT_START_PAUSED=1); a manual run_bot.bat starts active.
         # Owner must /resume before any Claude work runs.
@@ -187,3 +210,69 @@ class State:
             self.paused.add(chat_id)
         else:
             self.paused.discard(chat_id)
+
+    # ---- /confirm: gate a transcribed prompt behind ✅/✏️/🗑 buttons (per chat) ----
+    def get_confirm(self, chat_id: int) -> bool:
+        return self.confirm_voice.get(chat_id, True)  # default ON
+
+    def set_confirm(self, chat_id: int, on: bool) -> None:
+        self.confirm_voice[chat_id] = on
+
+    def get_pending_voice(self, chat_id: int) -> Optional[tuple[str, bool]]:
+        return self.pending_voice.get(chat_id)
+
+    def set_pending_voice(self, chat_id: int, value) -> None:
+        if value is None:
+            self.pending_voice.pop(chat_id, None)
+        else:
+            self.pending_voice[chat_id] = value
+
+    def get_await_edit(self, chat_id: int) -> bool:
+        return self.await_edit.get(chat_id, False)
+
+    def set_await_edit(self, chat_id: int, on: bool) -> None:
+        if on:
+            self.await_edit[chat_id] = True
+        else:
+            self.await_edit.pop(chat_id, None)
+
+    # ---- /draft: accumulate voice fragments into one prompt (per chat) ----
+    def get_draft_mode(self, chat_id: int) -> bool:
+        return self.draft_mode.get(chat_id, False)
+
+    def set_draft_mode(self, chat_id: int, on: bool) -> None:
+        if on:
+            self.draft_mode[chat_id] = True
+        else:
+            self.draft_mode.pop(chat_id, None)
+
+    def get_draft(self, chat_id: int) -> list[str]:
+        return self.draft.get(chat_id, [])
+
+    def set_draft(self, chat_id: int, frags: list[str]) -> None:
+        self.draft[chat_id] = frags
+
+    def clear_draft(self, chat_id: int) -> None:
+        self.draft.pop(chat_id, None)
+
+    # ---- /reply_voice: speak a specific bot message you reply to (per chat) ----
+    def get_reply_voice(self, chat_id: int) -> bool:
+        return self.reply_voice.get(chat_id, False)
+
+    def set_reply_voice(self, chat_id: int, on: bool) -> None:
+        if on:
+            self.reply_voice[chat_id] = True
+        else:
+            self.reply_voice.pop(chat_id, None)
+
+    def remember_bot_text(self, chat_id: int, message_id: int, text: str) -> None:
+        """Cache a bot message's plain text by its message_id (for reply-voice)."""
+        d = self.bot_text.setdefault(chat_id, {})
+        d[message_id] = text
+        # trim oldest beyond the cap (dict preserves insertion order)
+        if len(d) > _BOT_TEXT_MAX:
+            for k in list(d.keys())[:-_BOT_TEXT_MAX]:
+                del d[k]
+
+    def get_bot_text(self, chat_id: int, message_id: int) -> Optional[str]:
+        return self.bot_text.get(chat_id, {}).get(message_id)

@@ -97,6 +97,9 @@ HELP = (
     "*/new* — начать новый диалог Claude (забыть контекст)\n"
     "*/speak* — озвучить голосом последний ответ 🔊\n"
     "*/voice on|off* — всегда отвечать голосом / обратно текстом\n"
+    "*/confirm on|off* — показывать распознанный голос с кнопками ✅/✏️/🗑 перед отправкой\n"
+    "*/draft on|off* — копить голосовые в черновик, отправить скопом («отправляй»/📤)\n"
+    "*/reply_voice on|off* — ответ (reply) на сообщение бота озвучивает именно его\n"
     "*(или напишите «ответь голосом …», «озвучь»)*\n"
     "*(или надиктуйте 🎤 — голос распознаётся и выполнится как задача)*\n\n"
     "*/diff* — git diff текущего проекта\n"
@@ -105,7 +108,11 @@ HELP = (
     "*/mode* — текущий режим · */mode balanced|full|strict* — сменить\n"
     "*/cancel* — прервать текущий запрос к Claude\n"
     "*/pause* · */resume* — приостановить/возобновить обработку запросов к Claude\n"
-    "*/note* — диктовка без Claude: on|off, folder <имя>, browse (листать/читать .md)\n"
+    "*/note* — диктовка без Claude (переключатель вкл/выкл); folder <имя>, browse (читать)\n"
+    "\n"
+    "*🎤 Голосом (без Claude)* — «пауза»/«продолжи», «новый диалог»,\n"
+    "«режим balanced|full|strict», «проект <имя>», «голосовые вкл|выкл», «статус», «отмена»,\n"
+    "«покажи записи» — открыть диктовки кнопками\n"
     "*/status* — состояние бота\n"
 )
 
@@ -201,12 +208,18 @@ async def _do_claude(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 STATE.last_cost[proj.name] = result.cost_usd
             STATE.last_answer[chat_id] = result.text or ""
             footer = M.make_footer(result.cost_usd, result.session_id, result.num_turns)
-            await M.reply_long(bot, chat_id, result.text or "(пустой ответ)", footer=footer)
+            sent_ids = await M.reply_long(
+                bot, chat_id, result.text or "(пустой ответ)", footer=footer, state=STATE)
+            if sent_ids:
+                # Cache the plain answer text by its first message_id so a later
+                # reply (when /reply_voice is on) can speak THIS specific answer.
+                STATE.remember_bot_text(chat_id, sent_ids[0], result.text or "")
             if (speak_reply or STATE.get_voice(chat_id)) and (result.text or "").strip():
                 await _speak_answer(update, context, result.text)
         else:
             tag = "⏱" if result.timed_out else "⚠️"
-            await M.reply_long(bot, chat_id, f"{tag} Claude не завершил запрос:\n\n{result.text}")
+            await M.reply_long(bot, chat_id, f"{tag} Claude не завершил запрос:\n\n{result.text}",
+                               state=STATE, render_markdown=False)
 
 
 async def _git(proj_path: str, args: list[str]) -> tuple[int, str]:
@@ -359,6 +372,414 @@ async def _run_dictation(update: Update, context: ContextTypes.DEFAULT_TYPE, voi
     )
 
 
+# ---- voice control: local command interception (no Claude) -----------------
+# A transcribed voice message is matched against a small set of Russian command
+# intents and executed LOCALLY (pause/resume, voice-mode, new dialog, project,
+# mode, cancel, status) — Claude is never called. The match happens BEFORE the
+# pause gate in cmd_voice, so voice-control also works while Claude is paused
+# (e.g. «продолжи» resumes a paused bot). Triggers require an explicit keyword
+# so ordinary questions/requests still reach Claude.
+
+_CMD_NORM = re.compile(r"[^\w\s]", re.UNICODE)
+
+
+def _norm_cmd(text: str) -> str:
+    """Lowercase, ё→е, strip punctuation to spaces, collapse whitespace."""
+    t = (text or "").lower().replace("ё", "е")
+    t = _CMD_NORM.sub(" ", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+# canonical mode <- synonym prefixes (matched against a single normalized word)
+# Russian (what Whisper usually transcribes) + English fallbacks.
+_MODE_SYNONYMS = [
+    (["баланс", "балансед", "balanced"], "balanced"),
+    (["фулл", "фул", "полная свобода", "полный режим", "полного режима", "полный", "full"], "full"),
+    (["стрикт", "строг", "стрит", "только чтение", "strict"], "strict"),
+]
+
+# verbs that mark "this is a switch command" (vs. a question like "объясни режим")
+_SWITCH_VERBS = ("переключи", "выбери", "сделай", "поставь", "открой", "запусти", "включи")
+_MODE_VERBS = ("поставь", "смени", "переключи", "включи", "установи", "сделай", "вруб")
+# verbs that open the /note browse navigator when paired with a "записи/диктовки" word
+_SHOW_VERBS = ("покажи", "открой", "посмотри", "листай", "листать")
+
+
+def _match_mode_word(word: str) -> Optional[str]:
+    for syns, mode in _MODE_SYNONYMS:
+        for s in syns:
+            if word == s or word.startswith(s):
+                return mode
+    return None
+
+
+def _match_voice_command(text: str) -> Optional[tuple[str, object]]:
+    """Return (intent, args) or None.
+
+    intents: pause | resume | voice(bool) | new | project(str) | project_list
+             | mode(str) | cancel | status
+    """
+    s = _norm_cmd(text)
+    if not s:
+        return None
+    words = s.split()
+
+    # project: bare "проект <name>" at the start, OR "<switch-verb> проект <name>"
+    proj_idx = next((k for k, w in enumerate(words) if w.startswith("проект")), None)
+    if proj_idx is not None:
+        tail = " ".join(words[proj_idx + 1:])
+        before = words[:proj_idx]
+        is_bare = not before
+        has_verb = any(w in _SWITCH_VERBS for w in before)
+        if is_bare and not tail:
+            return ("project_list", None)
+        if tail and (is_bare or has_verb):
+            return ("project", tail)
+        # "расскажи про проект X" -> a question, falls through to Claude
+        return None
+
+    # mode: bare "режим <name>" at the start, OR "<verb> режим <name>"
+    rez_idx = next((k for k, w in enumerate(words) if w.startswith("режим")), None)
+    if rez_idx is not None:
+        before = words[:rez_idx]
+        is_bare = not before
+        has_verb = any(w in _MODE_VERBS for w in before)
+        if (is_bare or has_verb) and rez_idx + 1 < len(words):
+            w1 = words[rez_idx + 1]
+            m = _match_mode_word(w1)
+            if m is None and rez_idx + 2 < len(words):
+                m = _match_mode_word(w1 + " " + words[rez_idx + 2])  # "только чтение"
+            if m:
+                return ("mode", m)
+        return None  # "объясни режим …" / "какой режим" -> question -> Claude
+
+    # resume BEFORE pause (both may contain "пауз")
+    if (any(w.startswith("возобнов") or w.startswith("продолж") or w == "резюме" for w in words)
+            or "сними паузу" in s or "отмени паузу" in s or "снять паузу" in s):
+        return ("resume", None)
+    if ("на паузу" in s or "на паузе" in s or "приостанов" in s
+            or "поставь паузу" in s or "включи паузу" in s or "поставь на пауз" in s):
+        return ("pause", None)
+
+    # voice replies on/off
+    has_voice = any(w in ("голосовые", "голосовым", "голосовых", "голосовая", "голосовой")
+                    for w in words) or "отвечай голосом" in s or "отвечать голосом" in s
+    if has_voice or "только текст" in s:
+        if "только текст" in s or any(w in ("выкл", "off", "текст", "текстом", "только") for w in words):
+            return ("voice", False)
+        if any(w in ("вкл", "on", "всегда") for w in words) or "всегда голосом" in s:
+            return ("voice", True)
+        return ("voice_status", None)
+
+    # new dialog
+    if ("новый диалог" in s or "новая сессия" in s or "новый чат" in s
+            or "забудь контекст" in s or "сбрось контекст" in s or "начни заново" in s):
+        return ("new", None)
+
+    # browse dictations: "<show-verb> записи/диктовки" -> open /note browse
+    has_notes = any(w.startswith("запис") or w.startswith("диктов") for w in words)
+    if has_notes and any(w in _SHOW_VERBS for w in words):
+        return ("browse_notes", None)
+
+    # cancel
+    if (any(w in ("отмена", "отмени", "отменить", "стоп", "прервать", "прервано") for w in words)
+            or "отмени запрос" in s or "останови запрос" in s):
+        return ("cancel", None)
+
+    # status
+    if ("статус" in words or "состояние" in words
+            or "что происходит" in s or "чем занят" in s):
+        return ("status", None)
+
+    return None
+
+
+def _fuzzy_projects(query: str) -> list[str]:
+    """Projects whose normalized name matches `query` (exact > substring > token)."""
+    q = _norm_cmd(query)
+    names = [p.name for p in SETTINGS.projects]
+    if not q or not names:
+        return []
+    exact = [n for n in names if _norm_cmd(n) == q]
+    if exact:
+        return exact
+    substr = [n for n in names if q in _norm_cmd(n) or _norm_cmd(n) in q]
+    if substr:
+        return substr
+    qw = set(q.split())
+    return [n for n in names if qw & set(_norm_cmd(n).split())]
+
+
+def _do_pause(chat_id: int, on: bool) -> str:
+    if on:
+        STATE.set_pause(chat_id, True)
+        return ("⏸ Обработка запросов к Claude приостановлена.\n"
+                "Идущий запрос (если есть) доработает; новые — до «продолжи».")
+    if not STATE.get_pause(chat_id):
+        return "✅ Паузы нет — Claude уже работает."
+    STATE.set_pause(chat_id, False)
+    return "▶️ Обработка запросов к Claude возобновлена."
+
+
+def _set_voice_mode(chat_id: int, on: bool) -> str:
+    STATE.set_voice(chat_id, on)
+    if on:
+        return "🔊 Голосовые ответы ВКЛ — теперь каждый ответ приходит и голосом."
+    return "🔇 Голосовые ответы ВЫКЛ — ответы только текстом."
+
+
+def _do_new_dialog(chat_id: int) -> str:
+    proj = STATE.project_for_chat(chat_id)
+    STATE.clear_session(proj.name)
+    return f"🆕 Новый диалог для проекта *{proj.name}*."
+
+
+def _switch_project(chat_id: int, name: str) -> str:
+    candidates = _fuzzy_projects(name)
+    if len(candidates) == 1:
+        proj = STATE.switch_project(chat_id, candidates[0])
+        return f"📂 Выбран проект *{proj.name}*."
+    if not candidates:
+        avail = ", ".join(p.name for p in SETTINGS.projects) or "(нет)"
+        return f"Нет проекта, похожего на «{name}». Доступно: {avail}"
+    return ("Несколько проектов подходят — уточните:\n"
+            + "\n".join(f"• {c}" for c in candidates))
+
+
+def _set_mode(chat_id: int, mode: str, confirm: bool) -> tuple[str, bool]:
+    """Return (reply_text, needs_full_confirm_button)."""
+    if mode not in ("balanced", "full", "strict"):
+        return ("Режим должен быть: balanced, full или strict", False)
+    if mode == "full" and not confirm:
+        return ("⚠️ *full* отключает ВСЕ проверки прав — Claude сможет выполнять любые команды. "
+                "Подтвердите кнопкой ниже.", True)
+    STATE.set_mode(chat_id, mode)
+    return (f"Режим: *{mode}*", False)
+
+
+def _do_cancel(chat_id: int) -> str:
+    proj = STATE.project_for_chat(chat_id)
+    task = STATE.get_running(proj.name)
+    if task and task.proc is not None:
+        task.cancelled = True
+        _kill_proc_tree(task.proc)
+        return "🛑 Отменяю текущий запрос к Claude…"
+    return "Сейчас ничего не выполняется."
+
+
+def _status_text(chat_id: int) -> str:
+    proj = STATE.project_for_chat(chat_id)
+    mode = STATE.get_mode(chat_id)
+    sid = STATE.get_session(proj.name)
+    running = STATE.get_running(proj.name)
+    sid_str = (sid[:8] + "…") if sid else "нет"
+    lines = [
+        f"📂 Проект: *{proj.name}*",
+        f"⚙️ Режим: {mode}",
+        f"⏸ Пауза: {'да' if STATE.get_pause(chat_id) else 'нет'}",
+        f"🧠 Сессия: {sid_str}",
+        f"▶️ Выполняется: {'да' if (running and running.proc is not None) else 'нет'}",
+    ]
+    return "\n".join(lines)
+
+
+async def _dispatch_voice_command(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                  intent: str, args: object) -> None:
+    """Execute a matched voice command locally (no Claude)."""
+    chat_id = update.effective_chat.id
+    bot = context.bot
+    if intent == "pause":
+        await bot.send_message(chat_id=chat_id, text=_do_pause(chat_id, True),
+                               parse_mode=ParseMode.MARKDOWN)
+    elif intent == "resume":
+        await bot.send_message(chat_id=chat_id, text=_do_pause(chat_id, False),
+                               parse_mode=ParseMode.MARKDOWN)
+    elif intent == "voice":
+        await bot.send_message(chat_id=chat_id, text=_set_voice_mode(chat_id, bool(args)))
+    elif intent == "voice_status":
+        cur = STATE.get_voice(chat_id)
+        cur_str = "ВКЛ" if cur else "ВЫКЛ"
+        await bot.send_message(chat_id=chat_id,
+                               text=f"🔊 Голосовые ответы: {cur_str}. (скажите «голосовые вкл/выкл»)")
+    elif intent == "new":
+        await bot.send_message(chat_id=chat_id, text=_do_new_dialog(chat_id),
+                               parse_mode=ParseMode.MARKDOWN)
+    elif intent == "project":
+        await bot.send_message(chat_id=chat_id, text=_switch_project(chat_id, str(args)),
+                               parse_mode=ParseMode.MARKDOWN)
+    elif intent == "project_list":
+        cur = STATE.current.get(chat_id)
+        lines = ["*Проекты:*"]
+        for p in SETTINGS.projects:
+            mark = "✅ " if p.name == cur else "   "
+            lines.append(f"{mark}`{p.name}`")
+        await bot.send_message(chat_id=chat_id, text="\n".join(lines),
+                               parse_mode=ParseMode.MARKDOWN)
+    elif intent == "mode":
+        text, pending = _set_mode(chat_id, str(args), confirm=False)
+        if pending:
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Включить full", callback_data="mc:full"),
+                InlineKeyboardButton("❌ Отмена", callback_data="mc:no"),
+            ]])
+            await bot.send_message(chat_id=chat_id, text=text,
+                                   parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+        else:
+            await bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN)
+    elif intent == "cancel":
+        await bot.send_message(chat_id=chat_id, text=_do_cancel(chat_id))
+    elif intent == "status":
+        await bot.send_message(chat_id=chat_id, text=_status_text(chat_id),
+                               parse_mode=ParseMode.MARKDOWN)
+    elif intent == "browse_notes":
+        # voice-triggered /note browse: same inline-button navigator
+        await _note_browse_start(update, context)
+
+
+async def mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """mc:full / mc:no — confirm or decline voice-triggered `/mode full`."""
+    query = update.callback_query
+    chat_id = update.effective_chat.id
+    data = (query.data or "")[3:]
+    bot = context.bot
+    if data == "full":
+        STATE.set_mode(chat_id, "full")
+        msg = "Режим: *full* (подтверждено)."
+        try:
+            await query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN)
+        except Exception:  # noqa: BLE001
+            await bot.send_message(chat_id=chat_id, text=msg, parse_mode=ParseMode.MARKDOWN)
+    else:
+        try:
+            await query.edit_message_text("full НЕ включён — режим без изменений.")
+        except Exception:  # noqa: BLE001
+            await bot.send_message(chat_id=chat_id, text="full НЕ включён — режим без изменений.")
+    await query.answer()
+
+
+async def voice_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """vc:send|edit|cancel — the ✅/✏️/🗑 buttons under a recognized voice prompt."""
+    query = update.callback_query
+    chat_id = update.effective_chat.id
+    data = (query.data or "")[3:]
+    bot = context.bot
+
+    if data == "cancel":
+        STATE.set_pending_voice(chat_id, None)
+        STATE.set_await_edit(chat_id, False)
+        try:
+            await query.edit_message_text("🗑 Запрос отменён.")
+        except Exception:  # noqa: BLE001
+            await bot.send_message(chat_id=chat_id, text="🗑 Запрос отменён.")
+        await query.answer()
+        return
+
+    pending = STATE.get_pending_voice(chat_id)
+    if pending is None:
+        await query.answer("Запрос уже не активен.", show_alert=True)
+        return
+    prompt, speak_reply = pending
+
+    if data == "send":
+        STATE.set_pending_voice(chat_id, None)
+        await query.answer("Отправляю…")
+        try:
+            await query.delete_message()
+        except Exception:  # noqa: BLE001
+            pass
+        await _do_claude(update, context, prompt, is_task=True, speak_reply=speak_reply)
+        return
+
+    if data == "edit":
+        STATE.set_await_edit(chat_id, True)
+        STATE.set_pending_voice(chat_id, None)
+        try:
+            await query.edit_message_text(
+                "✏️ Пришлите исправленный текст следующим сообщением — "
+                "он заменит распознанный и уйдёт в Claude.")
+        except Exception:  # noqa: BLE001
+            pass
+        await query.answer()
+        return
+
+    await query.answer()
+
+
+def _is_draft_send_marker(text: str) -> bool:
+    """True if the utterance is (essentially) just a flush cue for the voice draft."""
+    s = _norm_cmd(text)
+    return s.startswith("отправ") or s in ("готово", "всё", "все готово", "вот и всё")
+
+
+async def _dispatch_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                           prompt: str, speak_reply: bool, note_msg_id: int) -> None:
+    """Route a finished voice/text prompt to Claude through the /confirm gate.
+
+    Shared by cmd_voice (single utterance) and the /draft flush (glued fragments).
+    """
+    chat_id = update.effective_chat.id
+    bot = context.bot
+    if STATE.get_confirm(chat_id):
+        if STATE.get_pending_voice(chat_id) is not None:
+            await bot.send_message(
+                chat_id=chat_id,
+                text="ℹ️ Предыдущий неподтверждённый голосовой запрос заменён новым.",
+            )
+        STATE.set_pending_voice(chat_id, (prompt, speak_reply))
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Отправить", callback_data="vc:send"),
+            InlineKeyboardButton("✏️ Править", callback_data="vc:edit"),
+            InlineKeyboardButton("🗑 Отмена", callback_data="vc:cancel"),
+        ]])
+        await bot.edit_message_text(
+            chat_id=chat_id, message_id=note_msg_id,
+            text=f"🎙 Распознано:\n\n{prompt[:1500]}\n\nПодтвердите отправку Claude:",
+            reply_markup=kb,
+        )
+        return
+    await bot.edit_message_text(
+        chat_id=chat_id, message_id=note_msg_id,
+        text=f"🎙 Распознано: {prompt[:800]}",
+    )
+    await _do_claude(update, context, prompt, is_task=True, speak_reply=speak_reply)
+
+
+async def draft_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """dr:send|clear — the 📤/🗑 buttons under an accumulating voice draft.
+
+    dr:send goes straight to Claude (the tap IS the confirmation; the draft
+    message is deleted, so the /confirm gate has no message to edit).
+    """
+    query = update.callback_query
+    chat_id = update.effective_chat.id
+    data = (query.data or "")[3:]
+    bot = context.bot
+    if data == "clear":
+        STATE.clear_draft(chat_id)
+        try:
+            await query.edit_message_text("🗑 Черновик очищен.")
+        except Exception:  # noqa: BLE001
+            await bot.send_message(chat_id=chat_id, text="🗑 Черновик очищен.")
+        await query.answer()
+        return
+    if data == "send":
+        draft = STATE.get_draft(chat_id)
+        if not draft:
+            await query.answer("Черновик пуст.", show_alert=True)
+            return
+        joined = "\n\n".join(draft)
+        STATE.clear_draft(chat_id)
+        await query.answer("Отправляю…")
+        try:
+            await query.delete_message()
+        except Exception:  # noqa: BLE001
+            pass
+        await _do_claude(update, context, joined, is_task=True,
+                         speak_reply=STATE.get_voice(chat_id))
+        return
+    await query.answer()
+
+
 # ---- handlers ---------------------------------------------------------------
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -383,6 +804,28 @@ async def cmd_freetext(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     chat_id = update.effective_chat.id
     if STATE.get_pause(chat_id):
         return  # paused: silently ignore free text — only slash-commands are answered
+    # 🔊 reply-voice: when on, replying to a bot message speaks THAT message.
+    if STATE.get_reply_voice(chat_id):
+        rt = update.message.reply_to_message
+        if rt is not None:
+            txt = STATE.get_bot_text(chat_id, rt.message_id)
+            if txt is not None:
+                await _speak_answer(update, context, txt)
+                return
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="🔇 Это сообщение уже не в кэше (старое) — ответьте на более свежее.",
+            )
+            return
+    # ✏️ edit-replacement: if the user clicked "Править" on a voice-confirm
+    # prompt, their next text message REPLACES the recognized prompt (not a new
+    # task). Stays under the pause gate (you can't edit-confirm while paused).
+    if STATE.get_await_edit(chat_id):
+        STATE.set_await_edit(chat_id, False)
+        text = (update.message.text or "").strip()
+        if text:
+            await _do_claude(update, context, text, is_task=True)
+        return
     text = (update.message.text or "").strip()
     wants_voice, cleaned = _extract_voice_request(text)
     if wants_voice:
@@ -396,7 +839,11 @@ async def cmd_freetext(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def cmd_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Transcribe a voice message: run as a task, or — under /note mode — append to file."""
+    """Transcribe a voice message.
+
+    Order: dictation (/note) -> voice-control command (no Claude, works while
+    paused) -> pause gate -> «ответь голосом» -> /confirm gate -> Claude task.
+    """
     chat_id = update.effective_chat.id
     voice = update.message.voice or update.message.audio
     if not voice:
@@ -405,8 +852,14 @@ async def cmd_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         # Dictation: voice -> file, no Claude. Ignores the pause gate (it never calls Claude).
         await _run_dictation(update, context, voice)
         return
-    if STATE.get_pause(chat_id):
-        return  # paused: silently ignore voice (also skips the STT transcription)
+    # 🔊 reply-voice: a voice reply on a bot message speaks THAT message (no STT).
+    if STATE.get_reply_voice(chat_id):
+        rt = update.message.reply_to_message
+        if rt is not None:
+            txt = STATE.get_bot_text(chat_id, rt.message_id)
+            if txt is not None:
+                await _speak_answer(update, context, txt)
+                return
     bot = context.bot
 
     await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
@@ -441,27 +894,73 @@ async def cmd_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await bot.send_message(chat_id=chat_id, text="🎙 Не удалось распознать речь (пустой результат).")
         return
 
+    # Voice-control interception — executed locally WITHOUT Claude, and BEFORE
+    # the pause gate so it also works while Claude is paused («продолжи»).
+    vcmd = _match_voice_command(text)
+    if vcmd:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=note.message_id)
+        except Exception:  # noqa: BLE001
+            pass
+        await _dispatch_voice_command(update, context, vcmd[0], vcmd[1])
+        return
+
+    # Non-command voice while paused: silently ignored (the transcribe above
+    # only happened so voice-control could fire).
+    if STATE.get_pause(chat_id):
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=note.message_id)
+        except Exception:  # noqa: BLE001
+            pass
+        return
+
     # Вырезаем запрос «ответь голосом» ДО отправки Claude — иначе модель видит
     # его и отказывается, ссылаясь на неспособность выдать аудио (озвучкой сам
     # занимается бот через speak.py). Та же логика, что в cmd_freetext.
     wants_voice, cleaned = _extract_voice_request(text)
 
-    await bot.edit_message_text(
-        chat_id=chat_id, message_id=note.message_id,
-        text=f"🎙 Распознано: {text[:800]}",   # показываем всё, что распознали
-    )
-
     if wants_voice and not cleaned:
         # одно лишь «ответь голосом» без вопроса -> озвучить последний ответ
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=note.message_id)
+        except Exception:  # noqa: BLE001
+            pass
         await cmd_speak(update, context)
         return
 
-    await _do_claude(
-        update, context,
-        cleaned if wants_voice else text,
-        is_task=True,
-        speak_reply=wants_voice,
-    )
+    prompt = cleaned if wants_voice else text
+
+    # /draft: accumulate voice fragments until a send-marker («отправляй»/
+    # «готово») or the 📤 button, then flush as one Claude request.
+    if STATE.get_draft_mode(chat_id):
+        draft = STATE.get_draft(chat_id)
+        if _is_draft_send_marker(text) and draft:
+            joined = "\n\n".join(draft)
+            STATE.clear_draft(chat_id)
+            await _dispatch_prompt(update, context, joined,
+                                   speak_reply=STATE.get_voice(chat_id),
+                                   note_msg_id=note.message_id)
+            return
+        draft.append(prompt)
+        STATE.set_draft(chat_id, draft)
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("📤 Отправить", callback_data="dr:send"),
+            InlineKeyboardButton("🗑 Очистить", callback_data="dr:clear"),
+        ]])
+        preview = "\n\n".join(draft)[:1200]
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=note.message_id,
+                text=(f"📝 Черновик ({len(draft)} фрагм.):\n\n{preview}\n\n"
+                      f"Скажите «отправляй»/«готово» или нажмите 📤."),
+                reply_markup=kb,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return
+
+    await _dispatch_prompt(update, context, prompt,
+                           speak_reply=wants_voice, note_msg_id=note.message_id)
 
 
 async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -481,7 +980,7 @@ async def cmd_diff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not out.strip():
         rc2, stat = await _git(proj.path, ["status", "-sb"])
         out = "Нет незакоммиченных изменений в tracked-файлах.\n\n" + stat
-    await M.reply_long(context.bot, chat_id, out or "(пусто)")
+    await M.reply_long(context.bot, chat_id, out or "(пусто)", render_markdown=False)
 
 
 async def cmd_git(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -508,7 +1007,7 @@ async def cmd_git(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         await context.bot.send_message(chat_id=chat_id, text=f"Неизвестная git-команда: {sub}")
         return
-    await M.reply_long(context.bot, chat_id, out or "(без вывода)")
+    await M.reply_long(context.bot, chat_id, out or "(без вывода)", render_markdown=False)
 
 
 async def cmd_project(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -639,6 +1138,117 @@ async def cmd_voice_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await context.bot.send_message(chat_id=chat_id, text="Использование: /voice on или /voice off")
 
 
+async def cmd_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Toggle the ✅/✏️/🗑 confirmation gate on transcribed voice (/confirm on|off)."""
+    chat_id = update.effective_chat.id
+    if not context.args:
+        cur = STATE.get_confirm(chat_id)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(f"📝 Подтверждение распознанного: {'ВКЛ' if cur else 'ВЫКЛ'}.\n"
+                  "/confirm on — показывать распознанный текст с кнопками перед отправкой Claude\n"
+                  "/confirm off — отправлять голос в Claude сразу"),
+        )
+        return
+    val = context.args[0].lower()
+    if val in ("on", "вкл", "1", "да", "yes", "true"):
+        STATE.set_confirm(chat_id, True)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="📝 Подтверждение ВКЛ — распознанный текст будет показан с кнопками ✅/✏️/🗑 перед отправкой.",
+        )
+    elif val in ("off", "выкл", "0", "нет", "no", "false"):
+        STATE.set_confirm(chat_id, False)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="📝 Подтверждение ВЫКЛ — распознанный голос отправляется в Claude сразу.",
+        )
+    else:
+        await context.bot.send_message(chat_id=chat_id, text="Использование: /confirm on или /confirm off")
+
+
+async def cmd_draft(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Voice draft: accumulate transcribed fragments and flush them as one request.
+
+    /draft            — status (+ preview)
+    /draft on|off     — toggle accumulation (OFF keeps any saved fragments)
+    /draft show       — print the accumulated draft
+    /draft clear      — drop the draft
+    """
+    chat_id = update.effective_chat.id
+    args = context.args
+    if not args:
+        on = STATE.get_draft_mode(chat_id)
+        draft = STATE.get_draft(chat_id)
+        preview = ("\n\n".join(draft)[:600]) if draft else "(пусто)"
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(f"📝 Черновик голосовых: {'ВКЛ' if on else 'ВЫКЛ'}.\n"
+                  f"Фрагментов: {len(draft)}\n\n{preview}\n\n"
+                  f"/draft on|off · /draft show · /draft clear\n"
+                  f"Пока вкл — голос копится; скажите «отправляй»/«готово» или жмите 📤."),
+        )
+        return
+    sub = args[0].lower()
+    if sub in ("on", "вкл", "1", "да", "yes", "true"):
+        STATE.set_draft_mode(chat_id, True)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="📝 Черновик ВКЛ — голосовые копятся, пока не скажете «отправляй»/«готово» или не нажмёте 📤.",
+        )
+    elif sub in ("off", "выкл", "0", "нет", "no", "false"):
+        STATE.set_draft_mode(chat_id, False)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="📝 Черновик ВЫКЛ — каждое голосовое снова уходит отдельным запросом. "
+                 "(Накопленные фрагменты сохранены — /draft clear чтобы стереть.)",
+        )
+    elif sub in ("show", "показать", "покажи"):
+        draft = STATE.get_draft(chat_id)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="📝 Черновик:\n\n" + (("\n\n".join(draft))[:3000] if draft else "(пусто)"),
+        )
+    elif sub in ("clear", "сбросить", "очистить", "стереть"):
+        STATE.clear_draft(chat_id)
+        await context.bot.send_message(chat_id=chat_id, text="🗑 Черновик очищен.")
+    else:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Использование: /draft · /draft on|off · /draft show · /draft clear",
+        )
+
+
+async def cmd_reply_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Toggle reply-voice: when ON, replying to a bot message speaks THAT message.
+
+    Default OFF (opt-in, as requested). Works for text and voice replies; the
+    target must still be in the in-memory bot-text cache (~50 recent answers).
+    """
+    chat_id = update.effective_chat.id
+    if not context.args:
+        cur = STATE.get_reply_voice(chat_id)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(f"🔊 Reply-озвучка: {'ВКЛ' if cur else 'ВЫКЛ'}.\n"
+                  "Когда вкл — ответ (reply) на сообщение бота озвучивает именно его "
+                  "(работает и текстом, и голосовым).\n/reply_voice on|off"),
+        )
+        return
+    val = context.args[0].lower()
+    if val in ("on", "вкл", "1", "да", "yes", "true"):
+        STATE.set_reply_voice(chat_id, True)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="🔊 Reply-озвучка ВКЛ — ответьте (reply) на любое сообщение бота, чтобы озвучить его.",
+        )
+    elif val in ("off", "выкл", "0", "нет", "no", "false"):
+        STATE.set_reply_voice(chat_id, False)
+        await context.bot.send_message(chat_id=chat_id, text="🔇 Reply-озвучка ВЫКЛ.")
+    else:
+        await context.bot.send_message(chat_id=chat_id, text="Использование: /reply_voice on или /reply_voice off")
+
+
 async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Pause Claude processing for this chat: gate /ask, /task and voice.
 
@@ -681,16 +1291,22 @@ async def cmd_note(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args
 
     if not args:
+        # /note with no args = TOGGLE dictation on/off
+        new_on = not STATE.get_note_mode(chat_id)
+        STATE.set_note_mode(chat_id, new_on)
         folder = STATE.get_note_folder(chat_id)
-        today = f"{datetime.now():%Y-%m-%d}"  # no ".md" -> not linkified by Telegram
-        on = STATE.get_note_mode(chat_id)
-        await bot.send_message(
-            chat_id=chat_id,
-            text=(f"📝 Диктовка: {'ВКЛ — голос пишется в файл' if on else 'ВЫКЛ — голос идёт в Claude'}.\n"
-                  f"📂 Папка: {folder}\n"
-                  f"📁 Сегодня: {folder}/{today}\n\n"
-                  f"/note on|off · /note folder <имя> · /note browse"),
-        )
+        if new_on:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=(f"📝 Диктовка ВКЛ.\n"
+                      f"Голосовые теперь пишутся в dictations/{folder}/ (без Claude).\n"
+                      f"/note — выключить · /note folder <имя> · /note browse — листать и читать."),
+            )
+        else:
+            await bot.send_message(
+                chat_id=chat_id,
+                text="🎙 Диктовка ВЫКЛ — голос снова идёт в Claude.",
+            )
         return
 
     sub = args[0].lower()
@@ -918,3 +1534,48 @@ async def note_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await query.answer("Ошибка обработки кнопки.", show_alert=True)
         except Exception:  # noqa: BLE001
             pass
+
+
+# ---- pagination of multi-page Claude answers (callback_data `pg:<i>`) --------
+
+async def page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """◀️/▶️ navigation for a paginated answer. Indexes into State.page_cache[chat_id].pages."""
+    query = update.callback_query
+    chat_id = update.effective_chat.id
+    data = (query.data or "")[3:]  # strip "pg:"
+    bot = context.bot
+    if data == "info":
+        await query.answer()
+        return
+    pc = STATE.page_cache.get(chat_id)
+    if not pc:
+        await query.answer("Страница устарела (ответ уже не активен).", show_alert=True)
+        return
+    try:
+        i = int(data)
+    except ValueError:
+        await query.answer()
+        return
+    if not (0 <= i < len(pc.pages)):
+        await query.answer("Страница не найдена.", show_alert=True)
+        return
+    pc.index = i
+    kb = M._page_kb(i, len(pc.pages))
+    try:
+        await query.edit_message_text(
+            text=pc.pages[i], parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True, reply_markup=kb,
+        )
+    except BadRequest:
+        # broken markup in this page -> retry as plain text
+        try:
+            await query.edit_message_text(
+                text=M._strip_tags(pc.pages[i]),
+                disable_web_page_preview=True, reply_markup=kb,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+    except Exception:  # noqa: BLE001
+        # "message is not modified", network blip, etc — not fatal
+        pass
+    await query.answer()
