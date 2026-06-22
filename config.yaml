@@ -1,0 +1,59 @@
+# Non-secret settings for the Claude Telegram bridge.
+# Secrets live in .env (TELEGRAM_BOT_TOKEN, ALLOWED_USER_IDS).
+
+claude_exe: "C:\\Users\\Aliaksandr\\.local\\bin\\claude.exe"
+# model intentionally omitted — auth/model already configured on the host
+
+default_mode: balanced        # balanced | full | strict
+timeout_minutes: 15
+max_budget_usd: 2.0           # hard per-call USD cap (--max-budget-usd) — the REAL guardrail
+max_turns: 30                 # passed but NOT guaranteed by CLI 2.1.183 — do not rely on it
+
+long_output_threshold_chars: 15000   # above this -> send output as a .txt file
+
+# Speech-to-text for voice messages. GROQ_API_KEY goes in .env (when provider: groq).
+stt:
+  provider: groq              # groq (fast, free tier, cloud) | local (offline, private)
+  groq_model: whisper-large-v3
+  local_model: small          # tiny|base|small|medium|large-v3 (bigger = better + slower)
+  language: ru                # ISO-639-1; set to "" for auto-detect
+
+# Text-to-speech for voice replies (/speak). ffmpeg required (winget install Gyan.FFmpeg).
+tts:
+  provider: edge              # edge (free, cloud) | silero (offline)
+  edge_voice: ru-RU-SvetlanaNeural   # ru-RU-DmitriNeural, ru-RU-DariyaNeural, ...
+  silero_speaker: aidar       # aidar|baya|kseniya|xsenia
+  language: ru                # ISO-639-1 (Silero); "" = auto-detect
+  rate: ""                    # e.g. "+10%" to speed up; "" = default
+  ffmpeg_path: ""             # absolute path to ffmpeg.exe; auto-detected if empty
+
+# Dictation mode (/note): voice messages are transcribed and APPENDED to a daily
+# .md journal, WITHOUT calling Claude. Category folders live under dictations_dir.
+dictations:
+  dir: ""                     # empty = C:\_AI\_Claude_Telegramm\dictations
+  default_folder: default     # used until you switch with /note folder <name>
+
+modes:
+  balanced:
+    permission_mode: acceptEdits
+    deny_tools:
+      - "Bash(rm -rf *)"
+      - "Bash(git push --force*)"
+      - "Bash(git push -f*)"
+  full:
+    permission_mode: bypassPermissions   # -> --dangerously-skip-permissions
+    deny_tools: []
+  strict:
+    permission_mode: plan
+    deny_tools:
+      - "Edit"
+      - "Write"
+
+# Projects Claude can work in. Add more at runtime via /project add <path>
+# or by editing this list. The "bot" project points at this bridge itself.
+projects:
+  - name: bot
+    path: "C:\\_AI\\_Claude_Telegramm"
+  # Example — uncomment and set a real path to add another project:
+  # - name: main
+  #   path: "C:\\_AI\\SomeProject"
