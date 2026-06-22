@@ -1,5 +1,9 @@
 # Claude Code ↔ Telegram Bridge
 
+![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
+![Platform](https://img.shields.io/badge/Platform-Windows-0078D6?logo=windows&logoColor=white)
+![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
+
 Удалённое управление Claude Code на домашнем Windows ПК с Android через Telegram.
 Бот принимает текстовые команды, запускает `claude -p` (headless) и возвращает ответ.
 
