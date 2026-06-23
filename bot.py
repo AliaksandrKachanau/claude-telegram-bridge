@@ -6,6 +6,7 @@ or via run_bot.bat.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sys
@@ -67,16 +68,46 @@ def main() -> None:
 
     def _startup_text() -> str:
         proj = settings.projects[0].name if settings.projects else "—"
+        # Lead with the paused state when auto-started: the owner must know the bot
+        # came up PAUSED and needs /resume, otherwise Claude silently does nothing.
+        header = (
+            "⏸ Бот запущен на паузе.\nОтправь /resume, чтобы включить Claude."
+            if start_paused
+            else "🤖 Бот запущен."
+        )
         return (
-            "🤖 Бот запущен.\n"
+            header + "\n"
             f"📂 Проект: {proj}\n"
             f"⚙️ Режим: {settings.default_mode}\n"
-            f"⏸ Пауза: {'да (до /resume)' if start_paused else 'нет'}\n"
             "\n"
             "Команды: /ask /task /new /diff /git /project /mode /cancel "
             "/note /pause /resume /status\n"
             "/help — подробная справка"
         )
+
+    _bg_tasks: set = set()  # keep refs so background tasks aren't GC'd mid-flight
+
+    async def _notify_startup(application, text) -> None:
+        # Deliver the startup notice WITH RETRIES. At logon the network is often not up
+        # yet, and a single fire-and-forget send would be lost — so the owner wouldn't
+        # learn the bot came up (especially bad when it auto-starts PAUSED). Each user
+        # gets the message exactly once: only still-failing users are retried, up to
+        # ~5 min, then we give up. Runs as a background task so polling starts at once.
+        pending = set(settings.allowed_user_ids)
+        for attempt in range(30):
+            if not pending:
+                return
+            failed = set()
+            for uid in pending:
+                try:
+                    await application.bot.send_message(chat_id=uid, text=text)
+                except Exception as e:  # noqa: BLE001
+                    failed.add(uid)
+                    log.warning("startup notify to %s failed (attempt %d): %s", uid, attempt + 1, e)
+            pending = failed
+            if pending:
+                await asyncio.sleep(10)
+        log.warning("startup notify gave up for %s after 30 attempts", pending)
 
     async def _post_init(application) -> None:
         # First thing the owner sees after a (re)start: status + command cheatsheet +
@@ -87,11 +118,10 @@ def main() -> None:
             text += "\n\n" + "\n".join(H.render(await H.check_all(settings)))
         except Exception as e:  # noqa: BLE001
             log.warning("health check failed: %s", e)
-        for uid in settings.allowed_user_ids:
-            try:
-                await application.bot.send_message(chat_id=uid, text=text)
-            except Exception as e:  # noqa: BLE001
-                log.warning("startup notify to %s failed: %s", uid, e)
+        # Send via the retrying background task (network may be down at logon).
+        t = asyncio.create_task(_notify_startup(application, text))
+        _bg_tasks.add(t)
+        t.add_done_callback(_bg_tasks.discard)
 
     auth = authorized(settings)
     app = Application.builder().token(settings.token).post_init(_post_init).build()
