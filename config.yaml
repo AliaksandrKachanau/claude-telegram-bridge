@@ -37,23 +37,23 @@ modes:
   balanced:
     permission_mode: acceptEdits
     deny_tools:
-      - "Bash(rm -rf *)"
-      - "Bash(git push --force*)"
-      - "Bash(git push -f*)"
+    - "Bash(rm -rf *)"
+    - "Bash(git push --force*)"
+    - "Bash(git push -f*)"
   full:
     permission_mode: bypassPermissions   # -> --dangerously-skip-permissions
     deny_tools: []
   strict:
     permission_mode: plan
     deny_tools:
-      - "Edit"
-      - "Write"
+    - "Edit"
+    - "Write"
 
 # Projects Claude can work in. Add more at runtime via /project add <path>
 # or by editing this list. The "bot" project points at this bridge itself.
 projects:
-  - name: bot
-    path: "C:\\_AI\\_Claude_Telegramm"
+- name: bot
+  path: "C:\\_AI\\_Claude_Telegramm"
   # Example — uncomment and set a real path to add another project:
   # - name: main
   #   path: "C:\\_AI\\SomeProject"

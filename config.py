@@ -59,6 +59,11 @@ class Settings:
     # dictations (voice -> file, no Claude)
     dictations_dir: str = str(BASE_DIR / "dictations")  # root folder for .md journals
     dictations_default_folder: str = "default"          # category used until /note folder <name>
+    # editing secrets (token / groq key / allowed ids) via /config requires a password.
+    # The password itself comes from .env (CONFIG_PASSWORD) and is never serialized to
+    # config.yaml. If empty, secret editing via Telegram is disabled.
+    config_password: str = ""
+    config_unlock_seconds: int = 300  # how long /config unlock keeps secrets editable
 
     def project(self, name: str) -> Project | None:
         for p in self.projects:
@@ -67,7 +72,7 @@ class Settings:
         return None
 
 
-def _load_env() -> tuple[str, set[int], str]:
+def _load_env() -> tuple[str, set[int], str, str]:
     load_dotenv(ENV_PATH)
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     raw = os.environ.get("ALLOWED_USER_IDS", "").strip()
@@ -77,7 +82,8 @@ def _load_env() -> tuple[str, set[int], str]:
     if not ids:
         raise RuntimeError(f"ALLOWED_USER_IDS is not set in {ENV_PATH}")
     groq_key = os.environ.get("GROQ_API_KEY", "").strip()
-    return token, ids, groq_key
+    config_password = os.environ.get("CONFIG_PASSWORD", "").strip()
+    return token, ids, groq_key, config_password
 
 
 def _resolve_claude_exe(cfg_value: str) -> str:
@@ -112,12 +118,13 @@ def _load_projects(raw: list) -> list[Project]:
 
 
 def load() -> Settings:
-    token, ids, groq_key = _load_env()
+    token, ids, groq_key, config_password = _load_env()
     cfg = _load_yaml()
 
     stt = cfg.get("stt", {}) or {}
     tts = cfg.get("tts", {}) or {}
     dct = cfg.get("dictations", {}) or {}
+    sec = cfg.get("config", {}) or {}
 
     dct_dir_raw = str(dct.get("dir", "") or "").strip()
     dictations_dir = dct_dir_raw or str(BASE_DIR / "dictations")
@@ -159,9 +166,66 @@ def load() -> Settings:
         tts_ffmpeg_path=str(tts.get("ffmpeg_path", "") or ""),
         dictations_dir=dictations_dir,
         dictations_default_folder=str(dct.get("default_folder", "default") or "default").strip(),
+        config_password=config_password,
+        config_unlock_seconds=int(sec.get("unlock_seconds", 300)),
     )
 
 
 def _load_yaml() -> dict:
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
+
+
+# ---- persistence (surgical, comment-preserving) ---------------------------
+#
+# Each /config edit changes ONE field, so we write exactly that one key path rather
+# than dumping the whole Settings object. Loading with ruamel.yaml and reassigning a
+# single leaf preserves the file's comments and formatting on every OTHER key
+# (reassigning a scalar even keeps its own end-of-line comment). A full rewrite would
+# drop comments inside the `projects` list and on detached lines.
+
+def save_field(yaml_path, value) -> None:
+    """Update one config.yaml key path (e.g. ``["tts", "edge_voice"]``), atomically.
+
+    ruamel.yaml round-trip keeps comments; falls back to PyYAML (comments lost) if
+    ruamel is unavailable. Intermediate mappings are created if absent. Atomic via
+    temp file + os.replace on the same filesystem.
+
+    Known limitation: ruamel drops the 2-line prose header above the top-level
+    ``projects:`` block when the edited value is a NON-EMPTY sequence (i.e. editing a
+    ``modes.<name>.deny_tools`` that already has items). Scalar edits and every other
+    comment are preserved. This is cosmetic (the project entries and their "Example"
+    comment survive) and preferable to a full rewrite, which loses all comments.
+    """
+    tmp = CONFIG_PATH.with_suffix(CONFIG_PATH.suffix + ".tmp")
+    try:
+        from collections.abc import Mapping
+        from ruamel.yaml import YAML
+        y = YAML()
+        y.preserve_quotes = True
+        y.default_flow_style = False
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            doc = y.load(f)
+        if not isinstance(doc, Mapping):
+            doc = y.map()
+        node = doc
+        for key in yaml_path[:-1]:
+            child = node.get(key) if isinstance(node, Mapping) else None
+            if not isinstance(child, Mapping):
+                child = y.map()
+                node[key] = child
+            node = child
+        node[yaml_path[-1]] = value
+        with open(tmp, "w", encoding="utf-8") as f:
+            y.dump(doc, f)
+    except Exception:  # noqa: BLE001 — ruamel missing or any error
+        log.warning("ruamel save_field failed; falling back to yaml.safe_dump")
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        node = data
+        for key in yaml_path[:-1]:
+            node = node.setdefault(key, {})
+        node[yaml_path[-1]] = value
+        with open(tmp, "w", encoding="utf-8") as f:
+            yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
+    os.replace(tmp, CONFIG_PATH)

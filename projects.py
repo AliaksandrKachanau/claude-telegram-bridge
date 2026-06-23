@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -81,6 +82,11 @@ class State:
         # Owner must /resume before any Claude work runs.
         self.paused: set[int] = set(settings.allowed_user_ids) if start_paused else set()
         self.claude_lock = asyncio.Lock()           # global serialization of claude calls
+        # /config secret editing: per-chat unlock deadline (time.monotonic) and the field
+        # key awaiting a typed new value. Both in-memory only; reset on restart.
+        self.config_unlock: dict[int, float] = {}   # chat_id -> monotonic deadline
+        self.config_pending: dict[int, str] = {}    # chat_id -> CONFIG_FIELDS key
+        self.config_msg_id: dict[int, int] = {}     # chat_id -> active /config inline message id
         self._load_sessions()
 
     # ---- projects ----
@@ -276,3 +282,33 @@ class State:
 
     def get_bot_text(self, chat_id: int, message_id: int) -> Optional[str]:
         return self.bot_text.get(chat_id, {}).get(message_id)
+
+    # ---- /config: secret-editing unlock (lazy timeout) + pending typed value ----
+    def is_config_unlocked(self, chat_id: int) -> bool:
+        """True if secret editing is currently unlocked for this chat (lazy expiry)."""
+        dl = self.config_unlock.get(chat_id)
+        return dl is not None and time.monotonic() < dl
+
+    def unlock_config(self, chat_id: int) -> None:
+        self.config_unlock[chat_id] = time.monotonic() + self.settings.config_unlock_seconds
+
+    def lock_config(self, chat_id: int) -> None:
+        self.config_unlock.pop(chat_id, None)
+
+    def get_config_pending(self, chat_id: int) -> Optional[str]:
+        return self.config_pending.get(chat_id)
+
+    def set_config_pending(self, chat_id: int, key) -> None:
+        if key is None:
+            self.config_pending.pop(chat_id, None)
+        else:
+            self.config_pending[chat_id] = key
+
+    def get_config_msg_id(self, chat_id: int) -> Optional[int]:
+        return self.config_msg_id.get(chat_id)
+
+    def set_config_msg_id(self, chat_id: int, msg_id) -> None:
+        if msg_id is None:
+            self.config_msg_id.pop(chat_id, None)
+        else:
+            self.config_msg_id[chat_id] = msg_id

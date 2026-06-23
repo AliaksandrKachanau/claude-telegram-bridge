@@ -6,7 +6,7 @@ REM background shell. Detection-by-command-line is needed because taskkill can o
 REM filter by image name, and other python processes may exist on this PC.
 setlocal enableextensions
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$p = Get-CimInstance Win32_Process -Filter \"Name='python.exe' OR Name='pythonw.exe'\" | Where-Object { $_.CommandLine -match 'bot\.py' }; if (-not $p) { Write-Host 'Bot is not running.' } else { $p | ForEach-Object { Write-Host ('Stopping PID ' + $_.ProcessId + ' (' + $_.Name + ')'); Stop-Process -Id $_.ProcessId -Force }; Write-Host 'Bot stopped.' }"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$p = Get-CimInstance Win32_Process -Filter \"Name='python.exe' OR Name='pythonw.exe'\" | Where-Object { $_.CommandLine -match 'bot\.py' }; if (-not $p) { Write-Host 'Bot is not running.' } else { $p | ForEach-Object { Write-Host ('Stopping PID ' + $_.ProcessId + ' (' + $_.Name + ')'); try { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop } catch {} }; Write-Host 'Bot stopped.' }"
 
 echo.
 pause

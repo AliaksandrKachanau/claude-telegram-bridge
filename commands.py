@@ -5,6 +5,7 @@ Dependencies (SETTINGS, STATE) are injected once via :func:`init` from bot.py.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import io
 import logging
 import os
@@ -14,6 +15,7 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 
+from dotenv import set_key
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest
@@ -24,7 +26,7 @@ import speak as TTS
 import transcribe as STT
 import health
 from claude_runner import _kill_proc_tree, run_claude
-from config import Settings
+from config import ENV_PATH, VALID_MODES, Settings, save_field
 from projects import RunningTask, State
 
 log = logging.getLogger(__name__)
@@ -114,6 +116,7 @@ HELP = (
     "«режим balanced|full|strict», «проект <имя>», «голосовые вкл|выкл», «статус», «отмена»,\n"
     "«покажи записи» — открыть диктовки кнопками\n"
     "*/status* — состояние бота\n"
+    "*/config* — настройки бота (секреты — после `/config unlock <пароль>`)\n"
 )
 
 
@@ -219,7 +222,8 @@ async def _do_claude(update: Update, context: ContextTypes.DEFAULT_TYPE,
         else:
             tag = "⏱" if result.timed_out else "⚠️"
             await M.reply_long(bot, chat_id, f"{tag} Claude не завершил запрос:\n\n{result.text}",
-                               state=STATE, render_markdown=False)
+                               state=STATE, render_markdown=False,
+                               file_threshold=SETTINGS.long_output_threshold)
 
 
 async def _git(proj_path: str, args: list[str]) -> tuple[int, str]:
@@ -802,6 +806,14 @@ async def cmd_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_freetext(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
+    # ✏️ /config value input: when a field edit is pending, the next text message
+    # becomes the new value (validated + applied + persisted). Lives BEFORE the pause
+    # gate so config editing works even while Claude is paused (like /note).
+    pending = STATE.get_config_pending(chat_id)
+    if pending:
+        STATE.set_config_pending(chat_id, None)
+        await _config_consume_value(update, context, pending)
+        return
     if STATE.get_pause(chat_id):
         return  # paused: silently ignore free text — only slash-commands are answered
     # 🔊 reply-voice: when on, replying to a bot message speaks THAT message.
@@ -980,7 +992,8 @@ async def cmd_diff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not out.strip():
         rc2, stat = await _git(proj.path, ["status", "-sb"])
         out = "Нет незакоммиченных изменений в tracked-файлах.\n\n" + stat
-    await M.reply_long(context.bot, chat_id, out or "(пусто)", render_markdown=False)
+    await M.reply_long(context.bot, chat_id, out or "(пусто)", render_markdown=False,
+                       file_threshold=SETTINGS.long_output_threshold)
 
 
 async def cmd_git(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1007,7 +1020,8 @@ async def cmd_git(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         await context.bot.send_message(chat_id=chat_id, text=f"Неизвестная git-команда: {sub}")
         return
-    await M.reply_long(context.bot, chat_id, out or "(без вывода)", render_markdown=False)
+    await M.reply_long(context.bot, chat_id, out or "(без вывода)", render_markdown=False,
+                       file_threshold=SETTINGS.long_output_threshold)
 
 
 async def cmd_project(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1376,12 +1390,17 @@ def _folders_kb(folders: list[str]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-async def _edit_or_send(query, bot, chat_id: int, text: str, reply_markup) -> None:
-    """Update the browsed message in place; if editing fails (e.g. older than 48h), send new."""
+async def _edit_or_send(query, bot, chat_id: int, text: str, reply_markup) -> int:
+    """Update the browsed message in place; if editing fails (e.g. older than 48h), send new.
+
+    Returns the message_id the content ended up on (the edited message, or the fresh one).
+    """
     try:
         await query.edit_message_text(text=text, reply_markup=reply_markup)
+        return query.message.message_id
     except BadRequest:
-        await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+        sent = await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+        return sent.message_id
 
 
 async def _note_browse_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1579,3 +1598,519 @@ async def page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         # "message is not modified", network blip, etc — not fatal
         pass
     await query.answer()
+
+
+# ---- /config: edit bot settings via inline buttons (callback_data `cf:`) --------
+#
+# A single CONFIG_FIELDS registry drives rendering, validation, application and
+# persistence for all editable settings. enum/mode_perm fields are set by tapping a
+# choice; scalar/secret fields prompt for the next text message (State.config_pending).
+# Non-secret edits mutate SETTINGS in memory (= live, the object is shared by reference)
+# and persist via config.save(); secret edits go to .env via dotenv.set_key and require
+# `/config unlock <password>`. Secrets are shown in full when unlocked (owner's choice)
+# and are NEVER logged. Removing one's own chat_id from allowed_user_ids is refused
+# (it would lock the owner out — @authorized reads that set live).
+
+from dataclasses import dataclass as _dc  # noqa: E402
+
+
+@_dc
+class FieldSpec:
+    key: str            # short ASCII id used in callback_data (cf:f:<index>)
+    group: str          # one of CONFIG_GROUPS
+    label: str          # human label (ru)
+    attr: str           # Settings attr, or "modes:<mode>:<sub>" for mode flags
+    kind: str           # enum|mode_perm|int|float|str|secret_str|id_list|tool_list
+    live: bool          # True = applies immediately; False = needs restart (⚠️)
+    secret: bool = False
+    env: str | None = None        # if secret: .env var name (written via dotenv.set_key)
+    yaml_path: tuple = ()         # if non-secret: config.yaml key path (e.g. ("tts","edge_voice"))
+    choices: tuple = ()
+    mn: float | None = None
+    mx: float | None = None
+    help: str = ""
+
+
+_PERM_CHOICES = ("plan", "acceptEdits", "bypassPermissions", "default")
+_LOCAL_MODELS = ("tiny", "base", "small", "medium", "large-v3")
+
+CONFIG_GROUPS = ["Общее", "Режимы", "STT", "TTS", "Диктовки", "Секреты"]
+
+CONFIG_FIELDS: list[FieldSpec] = [
+    # --- Общее ---
+    FieldSpec("mode", "Общее", "Режим по умолчанию", "default_mode", "enum", True,
+              choices=VALID_MODES, yaml_path=("default_mode",),
+              help="Пока чат не выбрал свой через /mode."),
+    FieldSpec("budget", "Общее", "Бюджет на запрос ($)", "max_budget_usd", "float", True,
+              mn=0, yaml_path=("max_budget_usd",),
+              help="Передаётся в claude как --max-budget-usd."),
+    FieldSpec("timeout", "Общее", "Таймаут (мин)", "timeout_minutes", "int", True,
+              mn=1, yaml_path=("timeout_minutes",),
+              help="Сколько ждать Claude до принудительной остановки."),
+    FieldSpec("maxturns", "Общее", "Max turns", "max_turns", "int", True,
+              mn=0, yaml_path=("max_turns",),
+              help="Best-effort (CLI может игнорировать). 0 = без лимита."),
+    FieldSpec("longout", "Общее", "Порог длинного вывода (зн.)", "long_output_threshold", "int", True,
+              mn=100, yaml_path=("long_output_threshold_chars",),
+              help="Длиннее этого — ответ уходит .txt-файлом."),
+    FieldSpec("claudeexe", "Общее", "claude.exe (путь)", "claude_exe", "str", False,
+              yaml_path=("claude_exe",),
+              help="⚠️ Проверка PATH идёт при старте — нужно перезапустить бота."),
+    # --- Режимы (modes.<name>.{permission_mode,deny_tools}) ---
+    FieldSpec("m_balanced_perm", "Режимы", "balanced: permission_mode",
+              "modes:balanced:permission_mode", "mode_perm", True,
+              choices=_PERM_CHOICES, yaml_path=("modes", "balanced", "permission_mode")),
+    FieldSpec("m_balanced_deny", "Режимы", "balanced: deny_tools",
+              "modes:balanced:deny_tools", "tool_list", True,
+              yaml_path=("modes", "balanced", "deny_tools"),
+              help="Запрещённые инструменты. Пришлите новый список (по строке)."),
+    FieldSpec("m_full_perm", "Режимы", "full: permission_mode",
+              "modes:full:permission_mode", "mode_perm", True,
+              choices=_PERM_CHOICES, yaml_path=("modes", "full", "permission_mode")),
+    FieldSpec("m_full_deny", "Режимы", "full: deny_tools",
+              "modes:full:deny_tools", "tool_list", True,
+              yaml_path=("modes", "full", "deny_tools")),
+    FieldSpec("m_strict_perm", "Режимы", "strict: permission_mode",
+              "modes:strict:permission_mode", "mode_perm", True,
+              choices=_PERM_CHOICES, yaml_path=("modes", "strict", "permission_mode")),
+    FieldSpec("m_strict_deny", "Режимы", "strict: deny_tools",
+              "modes:strict:deny_tools", "tool_list", True,
+              yaml_path=("modes", "strict", "deny_tools")),
+    # --- STT ---
+    FieldSpec("sttprov", "STT", "Провайдер STT", "stt_provider", "enum", True,
+              choices=("groq", "local"), yaml_path=("stt", "provider")),
+    FieldSpec("sttgroqmodel", "STT", "Groq модель", "stt_groq_model", "str", True,
+              yaml_path=("stt", "groq_model")),
+    FieldSpec("sttlocalmodel", "STT", "Локальная модель", "stt_local_model", "enum", False,
+              choices=_LOCAL_MODELS, yaml_path=("stt", "local_model"),
+              help="⚠️ Модель кэшируется — нужен рестарт."),
+    FieldSpec("sttlang", "STT", "Язык STT", "stt_language", "str", True,
+              yaml_path=("stt", "language"), help="ISO-639-1 (ru, en…). Пусто = авто."),
+    # --- TTS ---
+    FieldSpec("ttsprov", "TTS", "Провайдер TTS", "tts_provider", "enum", True,
+              choices=("edge", "silero"), yaml_path=("tts", "provider")),
+    FieldSpec("ttsedge", "TTS", "Edge голос", "tts_edge_voice", "str", True,
+              yaml_path=("tts", "edge_voice")),
+    FieldSpec("ttssilero", "TTS", "Silero спикер", "tts_silero_speaker", "str", True,
+              yaml_path=("tts", "silero_speaker")),
+    FieldSpec("ttslang", "TTS", "Язык TTS", "tts_language", "str", True,
+              yaml_path=("tts", "language")),
+    FieldSpec("ttsrate", "TTS", "Скорость TTS", "tts_rate", "str", True,
+              yaml_path=("tts", "rate"), help="Напр. +10% / -10%. Пусто = норма."),
+    FieldSpec("ttsffmpeg", "TTS", "ffmpeg (путь)", "tts_ffmpeg_path", "str", True,
+              yaml_path=("tts", "ffmpeg_path"), help="Пусто = авто-поиск."),
+    # --- Диктовки ---
+    FieldSpec("dictfolder", "Диктовки", "Папка по умолчанию", "dictations_default_folder", "str", True,
+              yaml_path=("dictations", "default_folder")),
+    FieldSpec("dictdir", "Диктовки", "Каталог диктовок", "dictations_dir", "str", True,
+              yaml_path=("dictations", "dir"),
+              help="⚠️ Существующие файлы не переносятся."),
+    # --- Секреты (требуют разблокировки) ---
+    FieldSpec("token", "Секреты", "Bot token", "token", "secret_str", False,
+              secret=True, env="TELEGRAM_BOT_TOKEN",
+              help="⚠️ Применится только после рестарта бота."),
+    FieldSpec("groqkey", "Секреты", "Groq API key", "groq_api_key", "secret_str", True,
+              secret=True, env="GROQ_API_KEY"),
+    FieldSpec("allowed", "Секреты", "Allowed user IDs", "allowed_user_ids", "id_list", True,
+              secret=True, env="ALLOWED_USER_IDS",
+              help="ID через запятую/пробел. СВОЙ id удалять нельзя."),
+]
+
+CONFIG_FIELDS_BY_KEY: dict[str, FieldSpec] = {f.key: f for f in CONFIG_FIELDS}
+
+
+def _group_index(group: str) -> int:
+    try:
+        return CONFIG_GROUPS.index(group)
+    except ValueError:
+        return 0
+
+
+def _config_get(spec: FieldSpec):
+    if spec.attr.startswith("modes:"):
+        _, mode, sub = spec.attr.split(":")
+        m = SETTINGS.modes.get(mode) or {}
+        if sub == "permission_mode":
+            return m.get("permission_mode", "plan")
+        return list(m.get("deny_tools") or [])
+    return getattr(SETTINGS, spec.attr)
+
+
+def _config_set(spec: FieldSpec, value) -> None:
+    if spec.attr.startswith("modes:"):
+        _, mode, sub = spec.attr.split(":")
+        m = SETTINGS.modes.setdefault(mode, {"permission_mode": "plan", "deny_tools": []})
+        m[sub] = value
+    else:
+        setattr(SETTINGS, spec.attr, value)
+
+
+def _config_range(v, spec: FieldSpec) -> None:
+    if spec.mn is not None and v < spec.mn:
+        raise ValueError(f"минимум {spec.mn:g}")
+    if spec.mx is not None and v > spec.mx:
+        raise ValueError(f"максимум {spec.mx:g}")
+
+
+def _config_validate(spec: FieldSpec, raw: str):
+    """Coerce + validate a raw text value. Returns the Python value or raises ValueError."""
+    k = spec.kind
+    if k in ("enum", "mode_perm"):
+        if raw not in spec.choices:
+            raise ValueError(f"допустимо: {', '.join(spec.choices)}")
+        return raw
+    if k == "int":
+        v = int(raw)  # ValueError on garbage
+        _config_range(v, spec)
+        return v
+    if k == "float":
+        v = float(raw)
+        _config_range(v, spec)
+        return v
+    if k in ("str", "secret_str"):
+        return (raw or "").strip()
+    if k == "id_list":
+        ids: set[int] = set()
+        for part in re.split(r"[,\s]+", (raw or "").strip()):
+            if not part:
+                continue
+            try:
+                ids.add(int(part))
+            except ValueError:
+                raise ValueError(f"не число: {part!r}")
+        return ids
+    if k == "tool_list":
+        out, seen = [], set()
+        for ln in (raw or "").splitlines():
+            t = ln.strip()
+            if t and t not in seen:
+                seen.add(t)
+                out.append(t)
+        return out
+    raise ValueError(f"неподдерживаемый тип: {k}")
+
+
+def _config_env_str(spec: FieldSpec, value) -> str:
+    if spec.attr == "allowed_user_ids":
+        return ",".join(str(i) for i in sorted(value))
+    return str(value)
+
+
+def _config_short(spec: FieldSpec, value, limit: int = 40) -> str:
+    """Compact value caption for list buttons / toasts."""
+    if spec.kind == "id_list":
+        s = ", ".join(str(i) for i in sorted(value)) if value else "—"
+    elif spec.kind == "tool_list":
+        s = f"{len(value)} шт." if value else "нет"
+    else:
+        s = str(value) if value != "" else "(пусто)"
+    return s if len(s) <= limit else s[: limit - 1] + "…"
+
+
+def _config_field_value_text(spec: FieldSpec, chat_id: int) -> str:
+    """Full current value for the field-detail view (secrets shown only if unlocked)."""
+    if spec.secret and not STATE.is_config_unlocked(chat_id):
+        return "🔒 заблокировано — /config unlock <пароль>"
+    v = _config_get(spec)
+    if spec.kind == "id_list":
+        return ", ".join(str(i) for i in sorted(v)) if v else "—"
+    if spec.kind == "tool_list":
+        return "\n".join(f"  • {t}" for t in v) if v else "(нет)"
+    return str(v) if v != "" else "(пусто)"
+
+
+def _config_apply_value(spec: FieldSpec, raw: str, chat_id: int) -> tuple[bool, str]:
+    """Validate, mutate SETTINGS live, persist. Returns (ok, message)."""
+    try:
+        value = _config_validate(spec, raw)
+    except ValueError as e:
+        return False, f"⚠️ Неверное значение: {e}"
+
+    # Never let the owner remove their own chat_id — @authorized reads this set live,
+    # so a bad edit would lock them out of the bot with no recovery.
+    if spec.attr == "allowed_user_ids" and chat_id not in value:
+        return False, "⚠️ Нельзя удалить свой собственный chat_id — иначе вы потеряете доступ к боту."
+
+    _config_set(spec, value)
+
+    try:
+        if spec.secret and spec.env:
+            os.environ[spec.env] = _config_env_str(spec, value)
+            set_key(str(ENV_PATH), spec.env, _config_env_str(spec, value))
+        else:
+            save_field(spec.yaml_path, value)
+    except Exception as e:  # noqa: BLE001
+        log.exception("config persist failed for %s", spec.key)
+        return False, f"⚠️ Применено в памяти, но не записано на диск: {e}"
+
+    restart = "" if spec.live else "\n⚠️ Применится только после рестарта бота."
+    if spec.secret:
+        return True, f"✅ {spec.label} обновлён.{restart}"
+    return True, f"✅ {spec.label}: {_config_short(spec, value)}.{restart}"
+
+
+def _config_root_text(chat_id: int) -> str:
+    if not SETTINGS.config_password:
+        sec = "🔒 Секреты: отключено (CONFIG_PASSWORD не задан в .env)"
+    elif STATE.is_config_unlocked(chat_id):
+        sec = "🔓 Секреты: разблокировано"
+    else:
+        sec = "🔒 Секреты: заблокировано (/config unlock <пароль>)"
+    return f"⚙️ Конфигурация\n\nРазделы:\n{sec}\n\nНажмите раздел, чтобы изменить."
+
+
+def _config_root_kb(chat_id: int) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for i, g in enumerate(CONFIG_GROUPS):
+        row.append(InlineKeyboardButton(g, callback_data=f"cf:g:{i}"))
+        if len(row) >= 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    if SETTINGS.config_password and STATE.is_config_unlocked(chat_id):
+        rows.append([InlineKeyboardButton("🔒 Заблокировать секреты", callback_data="cf:lock")])
+    rows.append([InlineKeyboardButton("✖️ Закрыть", callback_data="cf:close")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _config_show_root(query, bot, chat_id: int) -> None:
+    mid = await _edit_or_send(query, bot, chat_id, _config_root_text(chat_id), _config_root_kb(chat_id))
+    STATE.set_config_msg_id(chat_id, mid)
+    await query.answer()
+
+
+async def _config_show_group(query, bot, chat_id: int, gi: int) -> None:
+    if not (0 <= gi < len(CONFIG_GROUPS)):
+        await query.answer("Раздел не найден — /config.", show_alert=True)
+        return
+    gname = CONFIG_GROUPS[gi]
+    fields = [(i, f) for i, f in enumerate(CONFIG_FIELDS) if f.group == gname]
+    lines = [f"⚙️ {gname}", ""]
+    rows: list[list[InlineKeyboardButton]] = []
+    if gname == "Секреты" and not SETTINGS.config_password:
+        lines += ["🔒 Редактирование секретов отключено.",
+                  "Задайте CONFIG_PASSWORD в .env и перезапустите бота."]
+    elif gname == "Секреты" and not STATE.is_config_unlocked(chat_id):
+        lines += ["🔒 Секреты заблокированы.", "Введите: /config unlock <пароль>"]
+    else:
+        if gname == "Секреты":
+            lines.append("🔓 Разблокировано. Значения видны полностью.")
+        for i, f in fields:
+            cap = f.label if f.secret else f"{f.label}: {_config_short(f, _config_get(f))}"
+            rows.append([InlineKeyboardButton(cap, callback_data=f"cf:f:{i}")])
+        if gname == "Секреты":
+            rows.append([InlineKeyboardButton("🔒 Заблокировать", callback_data="cf:lock")])
+    rows.append([InlineKeyboardButton("← назад", callback_data="cf:root")])
+    mid = await _edit_or_send(query, bot, chat_id, "\n".join(lines), InlineKeyboardMarkup(rows))
+    STATE.set_config_msg_id(chat_id, mid)
+    await query.answer()
+
+
+def _config_field_payload(i: int, chat_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Build (text, keyboard) for a field's detail view. Reused by the inline view and by
+    the typed-value consumer (which has no query and edits the tracked message directly)."""
+    spec = CONFIG_FIELDS[i]
+    lines = [f"⚙️ {spec.label}", "", f"Текущее: {_config_field_value_text(spec, chat_id)}"]
+    if spec.help:
+        lines += ["", spec.help]
+    if not spec.live:
+        lines.append("⚠️ Применится только после рестарта.")
+    rows: list[list[InlineKeyboardButton]] = []
+    if spec.secret and not STATE.is_config_unlocked(chat_id):
+        rows.append([InlineKeyboardButton("🔒 /config unlock <пароль>", callback_data="cf:root")])
+    elif spec.kind in ("enum", "mode_perm"):
+        cur = _config_get(spec)
+        for j, c in enumerate(spec.choices):
+            mark = "✅ " if c == cur else ""
+            rows.append([InlineKeyboardButton(f"{mark}{c}", callback_data=f"cf:set:{i}:{j}")])
+    else:
+        rows.append([InlineKeyboardButton("✏️ Изменить", callback_data=f"cf:edit:{i}")])
+    rows.append([InlineKeyboardButton("← назад", callback_data=f"cf:g:{_group_index(spec.group)}")])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+async def _config_field_view(query, bot, chat_id: int, i: int) -> None:
+    if not (0 <= i < len(CONFIG_FIELDS)):
+        await query.answer("Поле не найдено — /config.", show_alert=True)
+        return
+    text, kb = _config_field_payload(i, chat_id)
+    mid = await _edit_or_send(query, bot, chat_id, text, kb)
+    STATE.set_config_msg_id(chat_id, mid)
+    await query.answer()
+
+
+async def _config_edit_prompt(query, bot, chat_id: int, i: int) -> None:
+    if not (0 <= i < len(CONFIG_FIELDS)):
+        await query.answer("Поле не найдено — /config.", show_alert=True)
+        return
+    spec = CONFIG_FIELDS[i]
+    if spec.secret and not STATE.is_config_unlocked(chat_id):
+        await query.answer("Секреты заблокированы — /config unlock.", show_alert=True)
+        return
+    STATE.set_config_pending(chat_id, spec.key)
+    if spec.kind == "tool_list":
+        prompt = (f"✏️ {spec.label}\nПришлите новый список deny_tools "
+                  f"(по одному в строке). /config — отмена.")
+    elif spec.kind == "id_list":
+        prompt = (f"✏️ {spec.label}\nПришлите id через запятую или пробел. "
+                  f"Свой id удалять нельзя. /config — отмена.")
+    else:
+        prompt = f"✏️ {spec.label}\nПришлите новое значение. Кнопка «отмена» — выйти."
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("отмена", callback_data=f"cf:f:{i}")]])
+    mid = await _edit_or_send(query, bot, chat_id, prompt, kb)
+    STATE.set_config_msg_id(chat_id, mid)
+    await query.answer()
+
+
+async def _config_do_set(query, bot, chat_id: int, i: int, j: int) -> None:
+    if not (0 <= i < len(CONFIG_FIELDS)) or not (0 <= j < len(CONFIG_FIELDS[i].choices)):
+        await query.answer("Вариант не найден — /config.", show_alert=True)
+        return
+    spec = CONFIG_FIELDS[i]
+    if spec.secret and not STATE.is_config_unlocked(chat_id):
+        await query.answer("Секреты заблокированы — /config unlock.", show_alert=True)
+        return
+    ok, msg = _config_apply_value(spec, spec.choices[j], chat_id)
+    if ok:
+        await _config_field_view(query, bot, chat_id, i)  # redraws + answers
+    else:
+        await query.answer(msg, show_alert=True)
+
+
+async def _config_consume_value(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str) -> None:
+    chat_id = update.effective_chat.id
+    bot = context.bot
+    spec = CONFIG_FIELDS_BY_KEY.get(key)
+    if spec is None:
+        await bot.send_message(chat_id, "Поле не найдено — /config.")
+        return
+    if spec.secret and not STATE.is_config_unlocked(chat_id):
+        await bot.send_message(chat_id, "🔒 Секреты снова заблокированы (истёк таймаут). "
+                                        "/config unlock <пароль>.")
+        return
+    raw = (update.message.text or "").strip()
+    if not raw:
+        await bot.send_message(chat_id, "Пустое значение. /config — открыть заново.")
+        return
+    # Best-effort: delete the user's typed value so it doesn't clutter the chat.
+    try:
+        await bot.delete_message(chat_id, update.message.message_id)
+    except Exception:  # noqa: BLE001
+        pass
+    ok, apply_msg = _config_apply_value(spec, raw, chat_id)
+    # Edit the tracked config message back to the field view (shows the new value + nav),
+    # replacing the stale edit-prompt and its "отмена" button. Prefix the apply result.
+    i = CONFIG_FIELDS.index(spec)
+    text, kb = _config_field_payload(i, chat_id)
+    text = f"{apply_msg}\n\n{text}"
+    mid = STATE.get_config_msg_id(chat_id)
+    if mid is not None:
+        try:
+            await bot.edit_message_text(chat_id=chat_id, message_id=mid, text=text, reply_markup=kb)
+            return
+        except Exception:  # noqa: BLE001 — message gone / too old: fall through to a new message
+            STATE.set_config_msg_id(chat_id, None)
+    sent = await bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
+    STATE.set_config_msg_id(chat_id, sent.message_id)
+
+
+async def _config_do_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                            chat_id: int, pw_parts: list[str]) -> None:
+    bot = context.bot
+    if not SETTINGS.config_password:
+        await bot.send_message(chat_id, "🔒 Редактирование секретов отключено. "
+                                        "Задайте CONFIG_PASSWORD в .env и перезапустите бота.")
+        return
+    # Best-effort: delete the message that contains the password so it doesn't linger.
+    deleted = True
+    try:
+        await bot.delete_message(chat_id, update.message.message_id)
+    except Exception:  # noqa: BLE001
+        deleted = False
+    pw = " ".join(pw_parts).strip()
+    if not pw:
+        await bot.send_message(chat_id, "Использование: /config unlock <пароль>")
+        return
+    if hmac.compare_digest(pw, SETTINGS.config_password):
+        STATE.unlock_config(chat_id)
+        mins = max(1, SETTINGS.config_unlock_seconds // 60)
+        extra = "" if deleted else "\n⚠️ Не удалось удалить сообщение с паролем — удалите его вручную."
+        await bot.send_message(chat_id, f"✅ Секреты разблокированы на ~{mins} мин.{extra}\n"
+                                        "Откройте /config → Секреты.")
+    else:
+        await bot.send_message(chat_id, "❌ Неверный пароль.")
+
+
+async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Edit bot settings via inline buttons. /config unlock <pw> | /config lock."""
+    chat_id = update.effective_chat.id
+    bot = context.bot
+    # Opening /config cancels any pending typed-value input.
+    STATE.set_config_pending(chat_id, None)
+    args = context.args
+    if args:
+        sub = args[0].lower()
+        if sub in ("unlock", "разблок", "разблокировать"):
+            await _config_do_unlock(update, context, chat_id, args[1:])
+            return
+        if sub in ("lock", "заблок", "заблокировать"):
+            STATE.lock_config(chat_id)
+            await bot.send_message(chat_id, "🔒 Секреты заблокированы.")
+            return
+    # A fresh /config opens a NEW root message (like /note browse). The message id is
+    # tracked so the typed-value consumer can edit THIS message back to the field view.
+    sent = await bot.send_message(chat_id=chat_id, text=_config_root_text(chat_id),
+                                  reply_markup=_config_root_kb(chat_id))
+    STATE.set_config_msg_id(chat_id, sent.message_id)
+
+
+async def config_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Route `cf:` inline-button taps for /config (mirror of note_callback's safety)."""
+    query = update.callback_query
+    chat_id = update.effective_chat.id
+    data = query.data or ""
+    parts = data.split(":")
+    op = parts[1] if len(parts) > 1 else ""
+    bot = context.bot
+    # Any navigation cancels a pending typed-value edit; the "edit" op re-sets it.
+    # Without this, tapping "отмена" then typing text would still consume that text.
+    if op != "edit":
+        STATE.set_config_pending(chat_id, None)
+    try:
+        if op == "root":
+            await _config_show_root(query, bot, chat_id)
+        elif op == "g":
+            await _config_show_group(query, bot, chat_id, int(parts[2]))
+        elif op == "f":
+            await _config_field_view(query, bot, chat_id, int(parts[2]))
+        elif op == "set":
+            await _config_do_set(query, bot, chat_id, int(parts[2]), int(parts[3]))
+        elif op == "edit":
+            await _config_edit_prompt(query, bot, chat_id, int(parts[2]))
+        elif op == "lock":
+            STATE.lock_config(chat_id)
+            await _config_show_root(query, bot, chat_id)  # redraws + answers
+        elif op == "close":
+            # Exit /config: drop the inline keyboard and end the session.
+            STATE.set_config_msg_id(chat_id, None)
+            try:
+                await query.edit_message_text("⚙️ Закрыто. /config — открыть снова.",
+                                              reply_markup=None)
+            except BadRequest:
+                try:
+                    await query.edit_message_reply_markup(reply_markup=None)
+                except Exception:  # noqa: BLE001
+                    pass
+            await query.answer()
+        else:
+            await query.answer()
+    except (ValueError, IndexError):
+        await query.answer("Кнопка устарела — откройте /config.", show_alert=True)
+    except Exception as e:  # noqa: BLE001
+        log.warning("config_callback error: %s", e)
+        try:
+            await query.answer("Ошибка обработки кнопки.", show_alert=True)
+        except Exception:  # noqa: BLE001
+            pass

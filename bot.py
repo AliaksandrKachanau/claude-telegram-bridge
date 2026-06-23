@@ -75,7 +75,7 @@ def main() -> None:
             f"⏸ Пауза: {'да (до /resume)' if start_paused else 'нет'}\n"
             "\n"
             "Команды: /ask /task /new /diff /git /project /mode /cancel /pause "
-            "/resume /note /confirm /draft /reply_voice /status\n"
+            "/resume /note /confirm /draft /reply_voice /status /config\n"
             "/help — подробная справка"
         )
 
@@ -135,6 +135,7 @@ def main() -> None:
     app.add_handler(CommandHandler("note", auth(C.cmd_note)))
     app.add_handler(CommandHandler("pause", auth(C.cmd_pause)))
     app.add_handler(CommandHandler("resume", auth(C.cmd_resume)))
+    app.add_handler(CommandHandler("config", auth(C.cmd_config)))
     # Inline buttons for /note browse (callback_data starts with "nb:").
     app.add_handler(CallbackQueryHandler(auth(C.note_callback), pattern=r"^nb:"))
     # Inline buttons for paginated answers (callback_data starts with "pg:").
@@ -145,6 +146,8 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(auth(C.voice_confirm_callback), pattern=r"^vc:"))
     # Inline buttons for voice draft (callback_data "dr:send|clear").
     app.add_handler(CallbackQueryHandler(auth(C.draft_callback), pattern=r"^dr:"))
+    # Inline buttons for /config editing (callback_data starts with "cf:").
+    app.add_handler(CallbackQueryHandler(auth(C.config_callback), pattern=r"^cf:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, auth(C.cmd_freetext)))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, auth(C.cmd_voice)))
 
