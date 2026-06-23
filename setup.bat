@@ -50,18 +50,29 @@ exit /b 0
 
 :install
 
-REM ---- 1. Locate Python 3.10+ (try 'python', then 'py -3') ----
+REM ---- 1. Locate Python 3.10+ ----
+REM Prefer an explicit 'py -3.XX' (the newest installed, independent of PATH
+REM order), then 'python' on PATH, then the launcher default 'py -3'. This way
+REM installing 3.12 alongside an old 3.7 reliably picks 3.12 even if 'python'
+REM still resolves to 3.7.
 set "PYEXE="
-python --version >nul 2>nul
-if %errorlevel%==0 set "PYEXE=python"
-
-if defined PYEXE goto :pyfound
-py -3 --version >nul 2>nul
-if %errorlevel%==0 set "PYEXE=py -3"
-
-:pyfound
+for %%V in (3.13 3.12 3.11 3.10) do (
+  if not defined PYEXE (
+    py -%%V --version >nul 2>nul
+    if not errorlevel 1 set "PYEXE=py -%%V"
+  )
+)
 if not defined PYEXE (
-  echo [FAIL] Python not found on PATH.
+  python --version >nul 2>nul
+  if not errorlevel 1 set "PYEXE=python"
+)
+if not defined PYEXE (
+  py -3 --version >nul 2>nul
+  if not errorlevel 1 set "PYEXE=py -3"
+)
+
+if not defined PYEXE (
+  echo [FAIL] Python not found.
   echo        Install Python 3.10+ from https://www.python.org/ and re-run setup.
   echo.
   pause
