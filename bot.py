@@ -34,9 +34,42 @@ def _setup_logging() -> None:
     logging.getLogger("telegram").setLevel(logging.WARNING)
 
 
+_MUTEX_HANDLE: list = [None]  # keep the single-instance mutex handle open for the process lifetime
+
+
+def _acquire_single_instance() -> bool:
+    """Ensure only one bot instance runs on this machine. Returns True to proceed.
+
+    Uses a named Windows mutex in the Local namespace (the bot runs in the owner's
+    interactive session, so Local needs no extra privilege). The OS releases it when
+    the process exits — even on a hard crash or `Stop-Process -Force` — so there is
+    no stale lockfile to clean up. A second launch refuses to start, which prevents
+    two pollers on one Telegram token (409 Conflict) and concurrent `claude -p`
+    corrupting ~/.claude.json.
+    """
+    if sys.platform != "win32":
+        return True  # guard is Windows-only; no-op elsewhere (the bot is Windows-only anyway)
+    import ctypes
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.CreateMutexW(None, False, r"Local\ClaudeTelegramBot")
+    if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS -> another instance owns it
+        kernel32.CloseHandle(handle)  # we didn't acquire it; release our duplicate handle
+        return False
+    _MUTEX_HANDLE[0] = handle  # keep the handle open until the process exits
+    return True
+
+
 def main() -> None:
     _setup_logging()
     log = logging.getLogger("bot")
+
+    if not _acquire_single_instance():
+        msg = ("Бот уже запущен — второй экземпляр не стартует, чтобы избежать "
+               "конфликта Telegram (409) и порчи claude.json. "
+               "Сначала stop_bot.bat, затем запуск.")
+        log.error(msg)
+        print(msg, flush=True)
+        sys.exit(1)
 
     from telegram.error import Conflict, NetworkError, TimedOut
     from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
