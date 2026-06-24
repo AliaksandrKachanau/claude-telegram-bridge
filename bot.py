@@ -67,8 +67,7 @@ def main() -> None:
         msg = ("Бот уже запущен — второй экземпляр не стартует, чтобы избежать "
                "конфликта Telegram (409) и порчи claude.json. "
                "Сначала stop_bot.bat, затем запуск.")
-        log.error(msg)
-        print(msg, flush=True)
+        log.error(msg)  # goes to bot.log + console (StreamHandler) — one line, no separate print
         sys.exit(1)
 
     from telegram.error import Conflict, NetworkError, TimedOut
