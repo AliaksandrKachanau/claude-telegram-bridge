@@ -535,14 +535,14 @@ def _set_voice_mode(chat_id: int, on: bool) -> str:
 def _do_new_dialog(chat_id: int) -> str:
     proj = STATE.project_for_chat(chat_id)
     STATE.clear_session(proj.name)
-    return f"🆕 Новый диалог для проекта *{proj.name}*."
+    return f"🆕 Новый диалог для проекта {proj.name}."
 
 
 def _switch_project(chat_id: int, name: str) -> str:
     candidates = _fuzzy_projects(name)
     if len(candidates) == 1:
         proj = STATE.switch_project(chat_id, candidates[0])
-        return f"📂 Выбран проект *{proj.name}*."
+        return f"📂 Выбран проект {proj.name}."
     if not candidates:
         avail = ", ".join(p.name for p in SETTINGS.projects) or "(нет)"
         return f"Нет проекта, похожего на «{name}». Доступно: {avail}"
@@ -578,7 +578,7 @@ def _status_text(chat_id: int) -> str:
     running = STATE.get_running(proj.name)
     sid_str = (sid[:8] + "…") if sid else "нет"
     lines = [
-        f"📂 Проект: *{proj.name}*",
+        f"📂 Проект: {proj.name}",
         f"⚙️ Режим: {mode}",
         f"⏸ Пауза: {'да' if STATE.get_pause(chat_id) else 'нет'}",
         f"🧠 Сессия: {sid_str}",
@@ -606,11 +606,9 @@ async def _dispatch_voice_command(update: Update, context: ContextTypes.DEFAULT_
         await bot.send_message(chat_id=chat_id,
                                text=f"🔊 Голосовые ответы: {cur_str}. (скажите «голосовые вкл/выкл»)")
     elif intent == "new":
-        await bot.send_message(chat_id=chat_id, text=_do_new_dialog(chat_id),
-                               parse_mode=ParseMode.MARKDOWN)
+        await bot.send_message(chat_id=chat_id, text=_do_new_dialog(chat_id))
     elif intent == "project":
-        await bot.send_message(chat_id=chat_id, text=_switch_project(chat_id, str(args)),
-                               parse_mode=ParseMode.MARKDOWN)
+        await bot.send_message(chat_id=chat_id, text=_switch_project(chat_id, str(args)))
     elif intent == "project_list":
         cur = STATE.current.get(chat_id)
         lines = ["*Проекты:*"]
@@ -633,8 +631,7 @@ async def _dispatch_voice_command(update: Update, context: ContextTypes.DEFAULT_
     elif intent == "cancel":
         await bot.send_message(chat_id=chat_id, text=_do_cancel(chat_id))
     elif intent == "status":
-        await bot.send_message(chat_id=chat_id, text=_status_text(chat_id),
-                               parse_mode=ParseMode.MARKDOWN)
+        await bot.send_message(chat_id=chat_id, text=_status_text(chat_id))
     elif intent == "browse_notes":
         # voice-triggered /note browse: same inline-button navigator
         await _note_browse_start(update, context)
@@ -980,8 +977,7 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     proj = STATE.project_for_chat(chat_id)
     STATE.clear_session(proj.name)
     await context.bot.send_message(
-        chat_id=chat_id, text=f"🆕 Новый диалог для проекта *{proj.name}*.",
-        parse_mode=ParseMode.MARKDOWN,
+        chat_id=chat_id, text=f"🆕 Новый диалог для проекта {proj.name}.",
     )
 
 
@@ -1029,12 +1025,13 @@ async def cmd_project(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     args = context.args
     if not args:
         cur = STATE.current.get(chat_id)
-        lines = ["*Проекты:*"]
+        # Plain text — p.path has '_' (breaks Markdown), same as /status.
+        lines = ["Проекты:"]
         for p in SETTINGS.projects:
             mark = "✅ " if p.name == cur else "   "
-            lines.append(f"{mark}`{p.name}` → {p.path}")
+            lines.append(f"{mark}{p.name} → {p.path}")
         lines.append("\nПереключение: /project <имя> · добавить: /project add <путь>")
-        await context.bot.send_message(chat_id=chat_id, text="\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+        await context.bot.send_message(chat_id=chat_id, text="\n".join(lines))
         return
     if args[0].lower() == "add":
         path = " ".join(args[1:]).strip().strip('"')
@@ -1045,7 +1042,7 @@ async def cmd_project(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await context.bot.send_message(chat_id=chat_id, text=f"Не удалось добавить: {e}")
             return
         STATE.current[chat_id] = proj.name
-        await context.bot.send_message(chat_id=chat_id, text=f"➕ Добавлен и выбран проект *{proj.name}*.", parse_mode=ParseMode.MARKDOWN)
+        await context.bot.send_message(chat_id=chat_id, text=f"➕ Добавлен и выбран проект {proj.name}.")
         return
     name = args[0]
     try:
@@ -1053,7 +1050,7 @@ async def cmd_project(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     except KeyError:
         await context.bot.send_message(chat_id=chat_id, text=f"Нет такого проекта: {name}")
         return
-    await context.bot.send_message(chat_id=chat_id, text=f"📂 Выбран проект *{proj.name}*.", parse_mode=ParseMode.MARKDOWN)
+    await context.bot.send_message(chat_id=chat_id, text=f"📂 Выбран проект {proj.name}.")
 
 
 async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1102,8 +1099,11 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     sid = STATE.get_session(proj.name)
     running = STATE.get_running(proj.name)
     cost = STATE.last_cost.get(proj.name)
+    # Plain text — no Markdown: proj.path has '_' (C:\_AI\_Claude_Telegramm) which
+    # Telegram's Markdown parser rejects as unmatched, so /status would get no reply.
+    # (Same reason the server block below is sent without parse_mode.)
     lines = [
-        f"📂 Проект: *{proj.name}*",
+        f"📂 Проект: {proj.name}",
         f"📁 {proj.path}",
         f"⚙️ Режим: {mode}",
         f"⏸ Пауза: {'да (до /resume)' if STATE.get_pause(chat_id) else 'нет'}",
@@ -1111,7 +1111,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"▶️ Выполняется: {'да' if (running and running.proc is not None) else 'нет'}",
         f"💲 Последний запрос: {('$%.4f' % cost) if cost is not None else '—'}",
     ]
-    await context.bot.send_message(chat_id=chat_id, text="\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    await context.bot.send_message(chat_id=chat_id, text="\n".join(lines))
     # Server connectivity (sent separately, no Markdown — hosts/errors may contain _ or .)
     try:
         srv = health.render(await health.check_all(SETTINGS))
