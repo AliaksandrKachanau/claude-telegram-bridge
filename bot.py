@@ -9,7 +9,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
 import sys
+import time
+from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -59,14 +62,41 @@ def _acquire_single_instance() -> bool:
     return True
 
 
+# --- Cross-machine single-instance guard ("incumbent stays") -----------------
+# The named mutex above only blocks a 2nd instance on THIS machine. Across
+# machines (same TELEGRAM_BOT_TOKEN), Telegram answers with 409 Conflict. That
+# 409 is SYMMETRIC: when two bots poll one token, BOTH receive 409s, so a naive
+# "exit on 409" makes BOTH exit (no bot left). Instead we track whether THIS
+# process has ever polled cleanly (incumbent). The established bot ignores 409s;
+# a bot that has seen ONLY 409s since startup (a late starter that never got a
+# word in) defers and exits. First-come-wins, no config, works across machines.
+_CONFLICT_GAP = 10.0    # s — a pause longer than this ends a conflict run
+_QUIET = 12.0           # s — this long without conflict/net-error => polled cleanly
+_INCUMBENCY_POLL = 5.0  # s — how often the incumbency watcher checks
+_YIELD_GRACE_MIN = 20.0  # s — a newcomer defers after this long of CONTIGUOUS 409s
+_YIELD_GRACE_MAX = 50.0  # s — per-process jitter (breaks the simultaneous-boot tie)
+
+
+@dataclass
+class _ConflictState:
+    """Mutable per-process state shared by _on_error and _watch_incumbency."""
+    last_conflict_at: float | None = None    # monotonic time of the most recent 409
+    last_net_error_at: float | None = None   # monotonic time of the most recent network error
+    incumbent: bool = False                  # once True: we polled cleanly, never defer
+    run_start: float | None = None           # start of the current contiguous 409 run
+    last_conflict_seen: float | None = None  # time of the previous 409 (for gap detection)
+    yielding: bool = False                   # guards _defer_and_exit against double-fire
+    yield_grace: float = 0.0                 # per-process jittered grace (s)
+
+
 def main() -> None:
     _setup_logging()
     log = logging.getLogger("bot")
 
     if not _acquire_single_instance():
-        msg = ("Бот уже запущен — второй экземпляр не стартует, чтобы избежать "
-               "конфликта Telegram (409) и порчи claude.json. "
-               "Сначала stop_bot.bat, затем запуск.")
+        msg = ("Bot is already running — a second instance refuses to start to avoid "
+               "a Telegram 409 conflict and claude.json corruption. "
+               "Run stop_bot.bat first, then launch again.")
         log.error(msg)  # goes to bot.log + console (StreamHandler) — one line, no separate print
         sys.exit(1)
 
@@ -87,14 +117,66 @@ def main() -> None:
     state = State(settings, start_paused=start_paused)
     C.init(settings, state)
 
+    # Per-process state for the cross-machine single-instance guard. yield_grace
+    # is jittered per process so two machines booting at the same instant don't
+    # BOTH defer: the one with the shorter grace exits first -> the other stops
+    # seeing 409 -> becomes incumbent -> survives. (See _on_error / _watch_incumbency.)
+    cs = _ConflictState(yield_grace=random.uniform(_YIELD_GRACE_MIN, _YIELD_GRACE_MAX))
+
+    async def _defer_and_exit(application) -> None:
+        # The late starter's exit: we've seen ONLY 409s since boot, so another
+        # instance owns this token (likely on another machine). Exit so exactly
+        # one bot polls. stop_running() unwinds run_polling cleanly; the process
+        # ends and the local mutex is released too.
+        if cs.yielding:
+            return
+        cs.yielding = True
+        log.error("Deferring — persistent 409 Conflict; this instance never polled "
+                  "cleanly. Another instance owns the token (likely another machine). "
+                  "This one exits; the active instance continues.")
+        # Best-effort one-time notice. send_message is a separate endpoint from
+        # getUpdates, so it works even mid-conflict. Bounded so a flaky link
+        # can't block the exit.
+        async def _notify() -> None:
+            text = ("⏭️ Этот экземпляр бота остановился: токен уже занят действующим "
+                    "poller-ом (409 Conflict, вероятно на другой машине). "
+                    "Работает активный экземпляр.")
+            for uid in settings.allowed_user_ids:
+                try:
+                    await application.bot.send_message(chat_id=uid, text=text)
+                except Exception:  # noqa: BLE001
+                    pass
+        try:
+            await asyncio.wait_for(_notify(), timeout=10)
+        except Exception:  # noqa: BLE001
+            pass
+        application.stop_running()
+
     async def _on_error(update, context) -> None:
         err = context.error
+        now = time.monotonic()
         # Transient network blips are expected on a weak connection -> concise log only.
         if isinstance(err, (NetworkError, TimedOut)):
+            cs.last_net_error_at = now  # quiet window must exclude outages (see _watch_incumbency)
             log.warning("transient network error (will auto-retry): %s", err)
             return
         if isinstance(err, Conflict):
-            log.warning("Conflict — another bot instance polling? %s", err)
+            # 409 is symmetric (both pollers get it). The incumbent (polled cleanly
+            # before) stays put; only a newcomer that has seen ONLY 409s since boot
+            # defers. This breaks the symmetry so exactly one bot survives.
+            cs.last_conflict_at = now
+            if cs.incumbent:
+                return
+            # Newcomer: a gap > _CONFLICT_GAP ends the run. This absorbs a transient
+            # 409 right after a same-machine restart (Telegram briefly holds the old
+            # connection ~5-10s) without falsely deferring.
+            if cs.last_conflict_seen is None or (now - cs.last_conflict_seen) > _CONFLICT_GAP:
+                cs.run_start = now
+                log.warning("409 Conflict — another poller holds this token. Never polled "
+                            "cleanly yet; will defer in ~%.0fs if it persists.", cs.yield_grace)
+            cs.last_conflict_seen = now
+            if cs.run_start is not None and (now - cs.run_start) >= cs.yield_grace:
+                await _defer_and_exit(context.application)
             return
         log.exception("unhandled error (update=%s): %s", update, err)
 
@@ -141,6 +223,23 @@ def main() -> None:
                 await asyncio.sleep(10)
         log.warning("startup notify gave up for %s after 30 attempts", pending)
 
+    async def _watch_incumbency() -> None:
+        # The flip side of the Conflict branch: declare us "incumbent" once we've
+        # polled cleanly for _QUIET seconds (no Conflict AND no network error =>
+        # getUpdates has been returning OK). A newcomer never gets here — it's
+        # flooded with 409s and defers via _on_error. Once incumbent, never yield.
+        while True:
+            await asyncio.sleep(_INCUMBENCY_POLL)
+            if cs.incumbent:
+                return
+            now = time.monotonic()
+            conflict_quiet = cs.last_conflict_at is None or (now - cs.last_conflict_at) > _QUIET
+            net_quiet = cs.last_net_error_at is None or (now - cs.last_net_error_at) > _QUIET
+            if conflict_quiet and net_quiet:
+                cs.incumbent = True
+                log.info("Incumbent — clean polling established; will not defer to contenders.")
+                return
+
     async def _post_init(application) -> None:
         # First thing the owner sees after a (re)start: status + command cheatsheet.
         # Sent IMMEDIATELY via a RETRYING background task (network may be down at logon):
@@ -157,6 +256,10 @@ def main() -> None:
         t2 = asyncio.create_task(_send_health(application, settings))
         _bg_tasks.add(t2)
         t2.add_done_callback(_bg_tasks.discard)
+        # Incumbency watcher for the cross-machine single-instance guard.
+        t3 = asyncio.create_task(_watch_incumbency())
+        _bg_tasks.add(t3)
+        t3.add_done_callback(_bg_tasks.discard)
 
     async def _send_health(application, settings) -> None:
         try:
