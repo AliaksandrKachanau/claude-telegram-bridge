@@ -98,10 +98,10 @@ HELP = (
     "*(или просто напишите текст)* — то же, что /task\n\n"
     "*/new* — начать новый диалог Claude (забыть контекст)\n"
     "*/speak* — озвучить голосом последний ответ 🔊\n"
-    "*/voice on|off* — всегда отвечать голосом / обратно текстом\n"
-    "*/confirm on|off* — показывать распознанный голос с кнопками ✅/✏️/🗑 перед отправкой\n"
-    "*/draft on|off* — копить голосовые в черновик, отправить скопом («отправляй»/📤)\n"
-    "*/reply_voice on|off* — ответ (reply) на сообщение бота озвучивает именно его\n"
+    "*/voice* — статус + кнопка · */voice on|off* — всегда отвечать голосом / обратно текстом\n"
+    "*/confirm* — статус + кнопка · */confirm on|off* — распознанный голос с кнопками ✅/✏️/🗑\n"
+    "*/draft* — статус + кнопка · */draft on|off* — копить голосовые в черновик («отправляй»/📤)\n"
+    "*/reply_voice* — статус + кнопка · */reply_voice on|off* — озвучка ответом (reply) на сообщение\n"
     "*(или напишите «ответь голосом …», «озвучь»)*\n"
     "*(или надиктуйте 🎤 — голос распознаётся и выполнится как задача)*\n\n"
     "*/diff* — git diff текущего проекта\n"
@@ -110,7 +110,7 @@ HELP = (
     "*/mode* — текущий режим · */mode balanced|full|strict* — сменить\n"
     "*/cancel* — прервать текущий запрос к Claude\n"
     "*/pause* · */resume* — приостановить/возобновить обработку запросов к Claude\n"
-    "*/note* — диктовка без Claude (переключатель вкл/выкл); folder <имя>, browse (читать)\n"
+    "*/note* — диктовка без Claude (статус + кнопка вкл/выкл); folder <имя>, browse (читать)\n"
     "\n"
     "*🎤 Голосом (без Claude)* — «пауза»/«продолжи», «новый диалог»,\n"
     "«режим balanced|full|strict», «проект <имя>», «голосовые вкл|выкл», «статус», «отмена»,\n"
@@ -124,6 +124,7 @@ def init(settings: Settings, state: State) -> None:
     global SETTINGS, STATE
     SETTINGS = settings
     STATE = state
+    _init_toggles()
 
 
 # ---- helpers ----------------------------------------------------------------
@@ -1130,16 +1131,106 @@ async def cmd_speak(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _speak_answer(update, context, text)
 
 
+# ---- per-chat toggle switches (shared status text + inline flip button) -------
+# Bare /voice /confirm /draft /reply_voice /note show the current state with a
+# single button that flips it (re-rendering the same message in place). The
+# explicit "/cmd on|off" forms still work as before. callback_data = "tg:<key>:<0|1>"
+# where the value is the TARGET state the button applies. Built in init() because
+# the getters/setters are bound methods of STATE (not available at import time).
+_TOGGLES: dict[str, dict] = {}
+
+
+def _init_toggles() -> None:
+    _TOGGLES.clear()
+    _TOGGLES["voice"] = {
+        "get": STATE.get_voice, "set": STATE.set_voice,
+        "title": "🔊 Голосовые ответы",
+        "on": "Каждый ответ дублируется голосом.",
+        "off": "Ответы приходят только текстом.",
+    }
+    _TOGGLES["confirm"] = {
+        "get": STATE.get_confirm, "set": STATE.set_confirm,
+        "title": "📝 Подтверждение распознанного голоса",
+        "on": "Распознанный текст показывается с кнопками ✅/✏️/🗑 перед отправкой Claude.",
+        "off": "Голос отправляется в Claude сразу.",
+    }
+    _TOGGLES["reply_voice"] = {
+        "get": STATE.get_reply_voice, "set": STATE.set_reply_voice,
+        "title": "🔊 Reply-озвучка",
+        "on": "Ответ (reply) на сообщение бота озвучивает именно его.",
+        "off": "Ответы на сообщения бота не озвучиваются.",
+    }
+    _TOGGLES["draft"] = {  # body is dynamic (fragment count) -> rendered in _toggle_text
+        "get": STATE.get_draft_mode, "set": STATE.set_draft_mode,
+        "title": "📝 Черновик голосовых",
+    }
+    _TOGGLES["note"] = {  # body is dynamic (folder) -> rendered in _toggle_text
+        "get": STATE.get_note_mode, "set": STATE.set_note_mode,
+        "title": "📝 Диктовка",
+    }
+
+
+def _toggle_text(chat_id: int, key: str) -> str:
+    spec = _TOGGLES[key]
+    on = spec["get"](chat_id)
+    head = f"{spec['title']}: {'ВКЛ' if on else 'ВЫКЛ'}"
+    if key == "draft":
+        n = len(STATE.get_draft(chat_id))
+        body = ("Пока вкл — голос копится; скажите «отправляй»/«готово» или жмите 📤. "
+                f"Фрагментов: {n}. /draft show · /draft clear.")
+    elif key == "note":
+        folder = STATE.get_note_folder(chat_id)
+        body = (f"Голосовые пишутся в dictations/{folder}/ (без Claude)." if on
+                else "Голос снова идёт в Claude как задача.")
+    else:
+        body = spec["on"] if on else spec["off"]
+    return f"{head}\n{body}"
+
+
+def _toggle_markup(chat_id: int, key: str) -> InlineKeyboardMarkup:
+    """One button labelled with the action available right now (flip the state)."""
+    on = _TOGGLES[key]["get"](chat_id)
+    label, target = ("❌ Выключить", "0") if on else ("✅ Включить", "1")
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(label, callback_data=f"tg:{key}:{target}")]]
+    )
+
+
+async def _send_toggle_status(bot, chat_id: int, key: str) -> None:
+    """Bare-command reply: current status + a button to flip it."""
+    await bot.send_message(
+        chat_id=chat_id, text=_toggle_text(chat_id, key),
+        reply_markup=_toggle_markup(chat_id, key),
+    )
+
+
+async def toggle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """tg:<key>:<0|1> — apply the target state, then re-render the status + button."""
+    query = update.callback_query
+    chat_id = update.effective_chat.id
+    bot = context.bot
+    parts = (query.data or "").split(":")  # ["tg", key, "0"|"1"]
+    if len(parts) != 3 or parts[1] not in _TOGGLES:
+        await query.answer("Кнопка устарела — откройте статус заново.")
+        return
+    key, target = parts[1], parts[2] == "1"
+    _TOGGLES[key]["set"](chat_id, target)
+    text, markup = _toggle_text(chat_id, key), _toggle_markup(chat_id, key)
+    try:
+        await query.edit_message_text(text=text, reply_markup=markup)
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():  # double-tap on the same state
+            raise
+    except Exception:  # noqa: BLE001  message too old / deleted -> post a fresh one
+        await bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
+    await query.answer()
+
+
 async def cmd_voice_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Toggle always-voice replies for this chat: /voice on|off."""
     chat_id = update.effective_chat.id
     if not context.args:
-        cur = STATE.get_voice(chat_id)
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(f"🔊 Голосовые ответы: {'ВКЛ' if cur else 'ВЫКЛ'}.\n"
-                  "/voice on — все ответы дублируются голосом\n/voice off — только текст"),
-        )
+        await _send_toggle_status(context.bot, chat_id, "voice")
         return
     val = context.args[0].lower()
     if val in ("on", "вкл", "1", "да", "yes", "true"):
@@ -1156,13 +1247,7 @@ async def cmd_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     """Toggle the ✅/✏️/🗑 confirmation gate on transcribed voice (/confirm on|off)."""
     chat_id = update.effective_chat.id
     if not context.args:
-        cur = STATE.get_confirm(chat_id)
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(f"📝 Подтверждение распознанного: {'ВКЛ' if cur else 'ВЫКЛ'}.\n"
-                  "/confirm on — показывать распознанный текст с кнопками перед отправкой Claude\n"
-                  "/confirm off — отправлять голос в Claude сразу"),
-        )
+        await _send_toggle_status(context.bot, chat_id, "confirm")
         return
     val = context.args[0].lower()
     if val in ("on", "вкл", "1", "да", "yes", "true"):
@@ -1192,16 +1277,7 @@ async def cmd_draft(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     args = context.args
     if not args:
-        on = STATE.get_draft_mode(chat_id)
-        draft = STATE.get_draft(chat_id)
-        preview = ("\n\n".join(draft)[:600]) if draft else "(пусто)"
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(f"📝 Черновик голосовых: {'ВКЛ' if on else 'ВЫКЛ'}.\n"
-                  f"Фрагментов: {len(draft)}\n\n{preview}\n\n"
-                  f"/draft on|off · /draft show · /draft clear\n"
-                  f"Пока вкл — голос копится; скажите «отправляй»/«готово» или жмите 📤."),
-        )
+        await _send_toggle_status(context.bot, chat_id, "draft")
         return
     sub = args[0].lower()
     if sub in ("on", "вкл", "1", "да", "yes", "true"):
@@ -1241,13 +1317,7 @@ async def cmd_reply_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     """
     chat_id = update.effective_chat.id
     if not context.args:
-        cur = STATE.get_reply_voice(chat_id)
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(f"🔊 Reply-озвучка: {'ВКЛ' if cur else 'ВЫКЛ'}.\n"
-                  "Когда вкл — ответ (reply) на сообщение бота озвучивает именно его "
-                  "(работает и текстом, и голосовым).\n/reply_voice on|off"),
-        )
+        await _send_toggle_status(context.bot, chat_id, "reply_voice")
         return
     val = context.args[0].lower()
     if val in ("on", "вкл", "1", "да", "yes", "true"):
@@ -1305,22 +1375,9 @@ async def cmd_note(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args
 
     if not args:
-        # /note with no args = TOGGLE dictation on/off
-        new_on = not STATE.get_note_mode(chat_id)
-        STATE.set_note_mode(chat_id, new_on)
-        folder = STATE.get_note_folder(chat_id)
-        if new_on:
-            await bot.send_message(
-                chat_id=chat_id,
-                text=(f"📝 Диктовка ВКЛ.\n"
-                      f"Голосовые теперь пишутся в dictations/{folder}/ (без Claude).\n"
-                      f"/note — выключить · /note folder <имя> · /note browse — листать и читать."),
-            )
-        else:
-            await bot.send_message(
-                chat_id=chat_id,
-                text="🎙 Диктовка ВЫКЛ — голос снова идёт в Claude.",
-            )
+        # /note with no args = status + a button to flip dictation (uniform with
+        # /voice /confirm /draft /reply_voice). /note on|off still toggles directly.
+        await _send_toggle_status(bot, chat_id, "note")
         return
 
     sub = args[0].lower()

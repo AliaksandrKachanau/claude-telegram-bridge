@@ -309,6 +309,9 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(auth(C.draft_callback), pattern=r"^dr:"))
     # Inline buttons for /config editing (callback_data starts with "cf:").
     app.add_handler(CallbackQueryHandler(auth(C.config_callback), pattern=r"^cf:"))
+    # Inline buttons for toggle switches (/voice /confirm /draft /reply_voice /note
+    # bare): callback_data "tg:<key>:<0|1>".
+    app.add_handler(CallbackQueryHandler(auth(C.toggle_callback), pattern=r"^tg:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, auth(C.cmd_freetext)))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, auth(C.cmd_voice)))
 
