@@ -312,6 +312,9 @@ def main() -> None:
     # Inline buttons for toggle switches (/voice /confirm /draft /reply_voice /note
     # bare): callback_data "tg:<key>:<0|1>".
     app.add_handler(CallbackQueryHandler(auth(C.toggle_callback), pattern=r"^tg:"))
+    # Inline buttons for /project switching (callback_data "pj:<i>" — index into
+    # the configured projects list).
+    app.add_handler(CallbackQueryHandler(auth(C.project_callback), pattern=r"^pj:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, auth(C.cmd_freetext)))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, auth(C.cmd_voice)))
 

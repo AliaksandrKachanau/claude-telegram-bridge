@@ -1021,18 +1021,73 @@ async def cmd_git(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                        file_threshold=SETTINGS.long_output_threshold)
 
 
+def _project_current_name(chat_id: int) -> str | None:
+    """Active project name for display, WITHOUT project_for_chat's defaulting
+    side-effect (mirrors the original bare-/project read)."""
+    cur = STATE.current.get(chat_id)
+    if cur:
+        return cur
+    return SETTINGS.projects[0].name if SETTINGS.projects else None
+
+
+def _project_text(chat_id: int) -> str:
+    """Status line for the /project menu. Plain text (no parse_mode): project
+    paths contain '_' which breaks Telegram Markdown."""
+    cur = _project_current_name(chat_id) or "(не выбран)"
+    return (
+        "📂 Проекты\n"
+        f"Текущий: {cur}\n"
+        "Тапните кнопку, чтобы переключить.\n"
+        "Добавить: /project add <путь>"
+    )
+
+
+def _project_kb(chat_id: int) -> InlineKeyboardMarkup:
+    """One button per configured project (vertical). callback_data carries an
+    INDEX into SETTINGS.projects (not the name): bypasses the 64-byte
+    callback_data cap and Cyrillic names — same convention as /note browse (nb:).
+    The list is append-only (add_project appends; no removal), so indexes are
+    stable within a bot run."""
+    cur = _project_current_name(chat_id)
+    rows: list[list[InlineKeyboardButton]] = []
+    for i, p in enumerate(SETTINGS.projects):
+        label = ("✅ " if p.name == cur else "") + p.name
+        rows.append([InlineKeyboardButton(label, callback_data=f"pj:{i}")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _send_project_menu(bot, chat_id: int) -> None:
+    """Bare-/project reply: status text + a button per project (like the toggles)."""
+    await bot.send_message(
+        chat_id=chat_id, text=_project_text(chat_id), reply_markup=_project_kb(chat_id)
+    )
+
+
+async def project_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """pj:<i> — switch to SETTINGS.projects[i] and re-render the menu in place.
+    Template: toggle_callback (re-render) + note_callback (index bounds-check)."""
+    query = update.callback_query
+    chat_id = update.effective_chat.id
+    bot = context.bot  # CallbackQuery has no .bot in this PTB version — CLAUDE.md №10
+    try:
+        i = int((query.data or "").split(":")[1])
+    except (IndexError, ValueError):
+        await query.answer("Кнопка устарела — откройте /project заново.", show_alert=True)
+        return
+    if not (0 <= i < len(SETTINGS.projects)):  # list changed since this menu was rendered
+        await query.answer("Кнопка устарела — откройте /project заново.", show_alert=True)
+        return
+    proj = SETTINGS.projects[i]
+    STATE.switch_project(chat_id, proj.name)  # exact match; KeyError impossible after bounds-check
+    await _rerender(query, bot, chat_id, _project_text(chat_id), _project_kb(chat_id))
+    await query.answer(f"Выбран {proj.name}")
+
+
 async def cmd_project(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     args = context.args
     if not args:
-        cur = STATE.current.get(chat_id)
-        # Plain text — p.path has '_' (breaks Markdown), same as /status.
-        lines = ["Проекты:"]
-        for p in SETTINGS.projects:
-            mark = "✅ " if p.name == cur else "   "
-            lines.append(f"{mark}{p.name} → {p.path}")
-        lines.append("\nПереключение: /project <имя> · добавить: /project add <путь>")
-        await context.bot.send_message(chat_id=chat_id, text="\n".join(lines))
+        await _send_project_menu(context.bot, chat_id)
         return
     if args[0].lower() == "add":
         path = " ".join(args[1:]).strip().strip('"')
@@ -1215,14 +1270,7 @@ async def toggle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     key, target = parts[1], parts[2] == "1"
     _TOGGLES[key]["set"](chat_id, target)
-    text, markup = _toggle_text(chat_id, key), _toggle_markup(chat_id, key)
-    try:
-        await query.edit_message_text(text=text, reply_markup=markup)
-    except BadRequest as e:
-        if "not modified" not in str(e).lower():  # double-tap on the same state
-            raise
-    except Exception:  # noqa: BLE001  message too old / deleted -> post a fresh one
-        await bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
+    await _rerender(query, bot, chat_id, _toggle_text(chat_id, key), _toggle_markup(chat_id, key))
     await query.answer()
 
 
@@ -1458,6 +1506,23 @@ async def _edit_or_send(query, bot, chat_id: int, text: str, reply_markup) -> in
     except BadRequest:
         sent = await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
         return sent.message_id
+
+
+async def _rerender(query, bot, chat_id: int, text: str, reply_markup) -> None:
+    """Re-render an inline menu in place; if editing fails (message deleted /
+    older than 48h / otherwise uneditable — Telegram returns these as
+    BadRequest), post a fresh message instead.
+
+    A "not modified" no-op edit (tapped the already-active item / double-tap)
+    is ignored: the message already shows the right state.
+    """
+    try:
+        await query.edit_message_text(text=text, reply_markup=reply_markup)
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():  # deleted / too old to edit
+            await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+    except Exception:  # noqa: BLE001
+        await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
 
 
 async def _note_browse_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
