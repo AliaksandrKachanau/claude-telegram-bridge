@@ -17,6 +17,10 @@ Key correctness points (verified against Claude Code 2.1.183):
   defensive and falls back to surfacing the raw text rather than crashing.
 - `--max-turns` is NOT enforced by this CLI version; `--max-budget-usd` is the only
   reliable guardrail and is always passed.
+- A fixed `--append-system-prompt` tells the headless session it runs behind the
+  Telegram bridge: without it the model has no marker of its own deployment and
+  confabulates ("I'm an interactive window, not in Telegram") or says "shown
+  above", which never reaches the user.
 """
 from __future__ import annotations
 
@@ -35,6 +39,21 @@ log = logging.getLogger(__name__)
 
 # A process we may need to kill on /cancel. Both Popen (sync) expose .pid/.kill().
 ProcLike = Union["subprocess.Popen"]
+
+# Injected via --append-system-prompt so the headless session knows its own
+# deployment context. The user prompt arrives on stdin with no metadata, so
+# without this the model cannot tell it is talking through Telegram.
+BRIDGE_SYSTEM_PROMPT = (
+    "Ты работаешь в headless-режиме (claude -p) за Telegram-мостом на Windows: "
+    "пользователь пишет боту в Telegram, бот передаёт текст тебе и пересылает "
+    "обратно ТОЛЬКО финальный текст твоего ответа. "
+    "Никакого интерактивного окна, UI, «показано выше» и preview не существует: "
+    "пользователь не видит твои рассуждения, вызовы инструментов и план-режим. "
+    "Всё, что пользователь должен увидеть, включай в финальный текст ответа. "
+    "Созданные тобой файлы пользователь сам не увидит — если их содержимое важно, "
+    "приведи его (или ключевые части) в тексте ответа. "
+    "Отвечай кратко, на языке пользователя."
+)
 
 
 @dataclass
@@ -82,6 +101,9 @@ def _build_argv(
     argv += ["--max-budget-usd", str(settings.max_budget_usd)]
     if settings.max_turns:
         argv += ["--max-turns", str(settings.max_turns)]  # best-effort, not guaranteed
+
+    # Deployment context: fixed short string, safe on argv (unlike the user prompt).
+    argv += ["--append-system-prompt", BRIDGE_SYSTEM_PROMPT]
     return argv
 
 

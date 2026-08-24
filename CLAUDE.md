@@ -38,7 +38,7 @@ Telegram-бот (python-telegram-bot, async) на Windows, через котор
 |---|---|
 | `bot.py` | точка входа: логирование, `Application.builder().post_init(...)` (стартовое сообщение), регистрация хендлеров (включая `CallbackQueryHandler` для `/note`), обработчик ошибок, `run_polling(allowed_updates=["message","callback_query"], drop_pending_updates=True)` |
 | `config.py` | загрузка `.env` + `config.yaml`, дата-классы `Settings`/`Project`, маппинг режим→флаги |
-| `claude_runner.py` | **ядро**: async-обёртка над `claude -p` (argv, stdin, защитный разбор JSON, таймаут, kill дерева) |
+| `claude_runner.py` | **ядро**: async-обёртка над `claude -p` (argv, stdin, защитный разбор JSON, таймаут, kill дерева); всегда передаёт `--append-system-prompt` (`BRIDGE_SYSTEM_PROMPT`) — контекст «ты headless за Telegram-мостом», без него сессия не знает о своём развёртывании и конфабулирует («я не в Telegram», «показано выше») |
 | `projects.py` | состояние: текущий проект на чат, сессии (`sessions.json`), **глобальный лок**, `/cancel`, режимы, voice-режим, пауза (`/pause`/`/resume`; старт-на-паузе через env `BOT_START_PAUSED`), **режим диктовки** (`note_mode`/`note_folder`/`note_browse` + `BrowseCache`) |
 | `commands.py` | обработчики команд (`/ask /task /new /diff /git /project /mode /cancel /status /speak /voice /pause /resume /note`) + голосовой ввод/вывод + диктовка (`cmd_note`, `_run_dictation`, inline-навигация `note_callback`) |
 | `transcribe.py` | STT: Groq (по умолч.) / local faster-whisper (lazy) |
