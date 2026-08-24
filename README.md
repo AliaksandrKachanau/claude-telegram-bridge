@@ -7,6 +7,8 @@
 Удалённое управление Claude Code на домашнем Windows ПК с Android через Telegram.
 Бот принимает текстовые команды, запускает `claude -p` (headless) и возвращает ответ.
 
+Что нового — в [WHATS_NEW.md](WHATS_NEW.md).
+
 ## Поток
 
 ```
