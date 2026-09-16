@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -27,7 +28,7 @@ import transcribe as STT
 import health
 from claude_runner import _kill_proc_tree, run_claude
 from config import ENV_PATH, VALID_MODES, Settings, save_field
-from projects import RunningTask, State
+from projects import PendingPerm, RunningTask, State, TaskQueueItem
 
 log = logging.getLogger(__name__)
 
@@ -92,31 +93,38 @@ async def _speak_answer(update: Update, context: ContextTypes.DEFAULT_TYPE, text
     return True
 
 HELP = (
-    "🤖 *Claude Code Bridge*\n\n"
+    "🤖 *Claude Code Bridge*\n"
+    "\n"
+    "*💬 Диалог с Claude*\n"
     "*/ask <текст>* — вопрос/анализ (только чтение, безопасно)\n"
-    "*/task <текст>* — поручить работу (правка файлов по текущему режиму)\n"
-    "*(или просто напишите текст)* — то же, что /task\n\n"
-    "*/new* — начать новый диалог Claude (забыть контекст)\n"
-    "*/speak* — озвучить голосом последний ответ 🔊\n"
-    "*/voice* — статус + кнопка · */voice on|off* — всегда отвечать голосом / обратно текстом\n"
-    "*/confirm* — статус + кнопка · */confirm on|off* — распознанный голос с кнопками ✅/✏️/🗑\n"
-    "*/draft* — статус + кнопка · */draft on|off* — копить голосовые в черновик («отправляй»/📤)\n"
-    "*/reply_voice* — статус + кнопка · */reply_voice on|off* — озвучка ответом (reply) на сообщение\n"
+    "*/task <текст>* — поручить работу (правки по текущему режиму)\n"
+    "*(или просто напишите текст / надиктуйте 🎤)* — сработает как /task\n"
+    "*/new* — новый диалог (забыть контекст) · */cancel* — прервать текущий запрос\n"
+    "\n"
+    "*🔊 Голос*\n"
+    "*/voice on|off* — всегда отвечать голосом (без аргумента — статус + кнопка)\n"
+    "*/speak* — озвучить последний ответ 🔊\n"
+    "*/confirm on|off* — распознанный голос с кнопками ✏️ перед отправкой\n"
+    "*/draft on|off* — копить голосовые в черновик («отправляй»/📤)\n"
+    "*/reply_voice on|off* — озвучка ответом (reply) на сообщение бота\n"
     "*(или напишите «ответь голосом …», «озвучь»)*\n"
-    "*(или надиктуйте 🎤 — голос распознаётся и выполнится как задача)*\n\n"
-    "*/diff* — git diff текущего проекта\n"
-    "*/git status|log|diff|commit <msg>* — операции git\n"
-    "*/project* — список проектов · */project <имя>* — переключить · */project add <путь>*\n"
-    "*/mode* — текущий режим · */mode balanced|full|strict* — сменить\n"
-    "*/cancel* — прервать текущий запрос к Claude\n"
-    "*/pause* · */resume* — приостановить/возобновить обработку запросов к Claude\n"
-    "*/note* — диктовка без Claude (статус + кнопка вкл/выкл); folder <имя>, browse (читать)\n"
+    "\n"
+    "*📝 Заметки (диктовка)*\n"
+    "*/note on|off* — писать в файл без Claude: голос И набранный текст\n"
+    "*/note folder <имя>* — папка-категория · */note browse* — читать кнопками\n"
+    "\n"
+    "*🗂 Проекты и git*\n"
+    "*/project* — список проектов (кнопки) · */project <имя>* · */project add <путь>*\n"
+    "*/diff* — git diff текущего проекта · */git status|log|diff|commit <msg>*\n"
+    "\n"
+    "*⚙️ Режимы и управление*\n"
+    "*/mode* — текущий режим · */mode balanced|full|strict|manual* — сменить\n"
+    "*/pause* · */resume* — приостановить/возобновить запросы к Claude\n"
+    "*/status* — состояние бота · */config* — настройки (секреты — после `/config unlock <пароль>`)\n"
     "\n"
     "*🎤 Голосом (без Claude)* — «пауза»/«продолжи», «новый диалог»,\n"
-    "«режим balanced|full|strict», «проект <имя>», «голосовые вкл|выкл», «статус», «отмена»,\n"
+    "«режим balanced|full|strict|manual (ручной)», «проект <имя>», «голосовые вкл|выкл», «статус», «отмена»,\n"
     "«покажи записи» — открыть диктовки кнопками\n"
-    "*/status* — состояние бота\n"
-    "*/config* — настройки бота (секреты — после `/config unlock <пароль>`)\n"
 )
 
 
@@ -160,7 +168,30 @@ async def _do_claude(update: Update, context: ContextTypes.DEFAULT_TYPE,
             text="⏸ Claude на паузе. /resume — продолжить обработку запросов.",
         )
         return
+    try:
+        proj = STATE.project_for_chat(chat_id)
+    except RuntimeError as e:
+        await bot.send_message(chat_id=chat_id, text=str(e))
+        return
+
     if STATE.claude_lock.locked():
+        if SETTINGS.runner == "sdk":
+            # Message queue (sdk only): with ✅/❌ buttons a turn can wait
+            # minutes for a tap, and a flat refusal would bounce most messages.
+            # Bounded FIFO; overflow still refuses (subprocess keeps the old
+            # "⏳" behaviour — the default must not silently change).
+            item = TaskQueueItem(chat_id=chat_id, prompt=prompt, is_task=is_task,
+                                 speak_reply=speak_reply, update=update, context=context)
+            pos = STATE.queue_push(proj.name, item)
+            if pos is None:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(f"⏳ Очередь заполнена ({SETTINGS.task_queue_max}) — запрос не принят. "
+                          "Дождитесь окончания или /cancel."),
+                )
+            else:
+                await bot.send_message(chat_id=chat_id, text=f"📥 В очереди (позиция {pos}).")
+            return
         await bot.send_message(
             chat_id=chat_id,
             text="⏳ Уже выполняется запрос к Claude. Дождитесь окончания или /cancel.",
@@ -168,11 +199,6 @@ async def _do_claude(update: Update, context: ContextTypes.DEFAULT_TYPE,
         return
 
     async with STATE.claude_lock:
-        try:
-            proj = STATE.project_for_chat(chat_id)
-        except RuntimeError as e:
-            await bot.send_message(chat_id=chat_id, text=str(e))
-            return
         mode = STATE.get_mode(chat_id)
         mode_cfg = SETTINGS.modes[mode]
         session_id = STATE.get_session(proj.name)
@@ -180,19 +206,23 @@ async def _do_claude(update: Update, context: ContextTypes.DEFAULT_TYPE,
         task = RunningTask(proc=None)
         STATE.set_running(proj.name, task)
 
-        def register(proc) -> None:
-            task.proc = proc
-
         stop = asyncio.Event()
         typing = asyncio.create_task(_typing_loop(bot, chat_id, stop))
         try:
-            result = await run_claude(
-                prompt, proj, mode_cfg, SETTINGS,
-                is_task=is_task,
-                session_id=session_id,
-                new_session=(session_id is None),
-                register_proc=register,
-            )
+            if SETTINGS.runner == "sdk":
+                result = await _run_sdk_turn(update, context, task, prompt,
+                                             proj, mode, mode_cfg, session_id, is_task)
+            else:
+                def register(proc) -> None:
+                    task.proc = proc
+
+                result = await run_claude(
+                    prompt, proj, mode_cfg, SETTINGS,
+                    is_task=is_task,
+                    session_id=session_id,
+                    new_session=(session_id is None),
+                    register_proc=register,
+                )
         finally:
             stop.set()
             typing.cancel()
@@ -204,6 +234,7 @@ async def _do_claude(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
         if task.cancelled:
             await bot.send_message(chat_id=chat_id, text="🛑 Запрос отменён.")
+            _dispatch_queue(proj.name)
             return
 
         if result.ok:
@@ -225,6 +256,64 @@ async def _do_claude(update: Update, context: ContextTypes.DEFAULT_TYPE,
             await M.reply_long(bot, chat_id, f"{tag} Claude не завершил запрос:\n\n{result.text}",
                                state=STATE, render_markdown=False,
                                file_threshold=SETTINGS.long_output_threshold)
+        # sdk: relay to the next queued message, if any (not while paused).
+        _dispatch_queue(proj.name)
+
+
+async def _run_sdk_turn(update: Update, context: ContextTypes.DEFAULT_TYPE, task: RunningTask,
+                        prompt: str, proj, mode: str, mode_cfg: dict,
+                        session_id, is_task: bool):
+    """Drive one turn through the live SDK client (runner: sdk).
+
+    Lazy import: the bot must import and run in subprocess mode even when
+    claude-agent-sdk is not installed (pluggable/lazy convention).
+    """
+    import sdk_runner
+
+    perm_ui = _TelegramPermUI(update.effective_chat.id, context)
+    task.active = True
+
+    def register(hook) -> None:
+        task.cancel_hook = hook
+
+    try:
+        return await sdk_runner.run_turn(
+            prompt, proj, mode_cfg, SETTINGS,
+            is_task=is_task, mode_name=mode, session_id=session_id,
+            perm_ui=perm_ui, register_cancel_hook=register,
+        )
+    finally:
+        task.active = False
+        task.cancel_hook = None
+
+
+# Background refs so dispatched queue tasks are not GC'd mid-flight (the event
+# loop only holds weak references to bare tasks).
+_BG_TASKS: set = set()
+
+
+def _dispatch_queue(project_name: str) -> None:
+    """Start the next queued message for the project (sdk runner only).
+
+    Called after a turn finished (or was cancelled) and on /resume. A task, not
+    an await: the finished turn's handler must return, and its reply already
+    went out. Pause check is per queued item's chat — a paused owner keeps
+    their messages parked."""
+    if SETTINGS.runner != "sdk":
+        return
+    item = STATE.queue_pop(project_name)
+    if item is None:
+        return
+    if STATE.get_pause(item.chat_id):
+        # paused: park it back at the head and stop the relay
+        q = STATE.task_queue.setdefault(project_name, [])
+        q.insert(0, item)
+        return
+    t = asyncio.create_task(
+        _do_claude(item.update, item.context, item.prompt, item.is_task, item.speak_reply))
+    _BG_TASKS.add(t)
+    t.add_done_callback(_BG_TASKS.discard)
+    # exactly one relay per call; the dispatched turn relays on its own completion
 
 
 async def _git(proj_path: str, args: list[str]) -> tuple[int, str]:
@@ -247,6 +336,205 @@ async def _git(proj_path: str, args: list[str]) -> tuple[int, str]:
             return -2, "git превысил время ожидания"
 
     return await loop.run_in_executor(None, run)
+
+
+# ---- SDK permission buttons (callback_data `pm:<op>:<id>[:<opt>`) -------------
+#
+# The sdk runner's can_use_tool routes here: every non-read-only tool call
+# becomes a Telegram message with the call's key parameters and ✅/❌ buttons
+# (AskUserQuestion gets one button per option). Verdicts resolve a future the
+# SDK callback awaits; the SDK callback itself enforces its own timeout and
+# denies on any UI failure, so nothing here can kill the turn.
+
+_PERM_VALUE_LIMIT = 500    # chars per shown value — Write/Edit carry whole files
+_PERM_TEXT_LIMIT = 3000    # whole message cap (Telegram rejects past ~4096)
+
+# ".md" is a real TLD: "2026-09-10.md" linkifies into a broken link
+# (CLAUDE.md №9). A zero-width space after the dot keeps the text visually
+# identical but breaks the domain match.
+_MD_LINK_RE = re.compile(r"\.md\b", re.IGNORECASE)
+
+
+def _sanitize_perm_text(text: str) -> str:
+    return _MD_LINK_RE.sub(".md" + chr(0x200B), text or "")
+
+
+def _perm_preview(input_data: dict) -> str:
+    """Compact key:value view of a tool call's arguments (command/file_path/…)."""
+    lines = []
+    for k, v in (input_data or {}).items():
+        s = v if isinstance(v, str) else str(v)
+        if len(s) > _PERM_VALUE_LIMIT:
+            s = s[:_PERM_VALUE_LIMIT] + "…"
+        lines.append(f"{k}: {s}")
+    return _sanitize_perm_text("\n".join(lines))[:_PERM_TEXT_LIMIT]
+
+
+def _question_parts(q: dict) -> tuple[str, list[str]]:
+    """(question text, option labels) from one AskUserQuestion entry."""
+    qt = (q or {}).get("question") or (q or {}).get("header") or ""
+    labels = [(o or {}).get("label") or str(o) for o in ((q or {}).get("options") or [])]
+    return str(qt), labels
+
+
+class _TelegramPermUI:
+    """Perm-UI the sdk runner talks to: ask() shows buttons and awaits the tap
+    (bounded by permission_timeout_minutes), cancel_all() resolves everything
+    as denied (/cancel, turn timeout). Plain text only — tool arguments are
+    dynamic and would break Telegram Markdown (trap: silent no-send)."""
+
+    def __init__(self, chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+        self.chat_id = chat_id
+        self.bot = context.bot
+
+    async def _edit(self, message_id, text: str) -> None:
+        if message_id is None:
+            return
+        try:
+            await self.bot.edit_message_text(chat_id=self.chat_id, message_id=message_id,
+                                             text=text)
+        except Exception:  # noqa: BLE001 — message gone / too old: not fatal
+            pass
+
+    async def ask(self, tool_name: str, input_data: dict):
+        """Return ("allow", payload) or ("deny", message); payload carries the
+        {question: label} map for AskUserQuestion. A send failure returns deny
+        — the model is told why and can proceed without the tool."""
+        if tool_name == "AskUserQuestion":
+            return await self._ask_question_flow(input_data)
+        return await self._ask_tool_flow(tool_name, input_data)
+
+    async def _wait(self, pp: PendingPerm, pid: int) -> tuple:
+        """Await the tap with the button timeout; on expiry auto-deny and
+        rewrite the message. The just-missed-tap race is honoured: a future
+        resolved between the timeout and our check wins."""
+        timeout_s = SETTINGS.permission_timeout_minutes * 60
+        try:
+            return await asyncio.wait_for(pp.future, timeout=timeout_s)
+        except asyncio.TimeoutError:
+            # Py3.12 wait_for CANCELS the future on timeout, so done() alone is
+            # not "resolved in the race window" — .result() on a cancelled
+            # future raises CancelledError (a BaseException: it would slip past
+            # `except Exception` in sdk_runner and kill the turn as cancelled
+            # instead of auto-denying). Only a done+non-cancelled future is a
+            # just-missed tap.
+            if pp.future.done() and not pp.future.cancelled():
+                return pp.future.result()
+            STATE.pop_perm_prompt(self.chat_id, pid)
+            await self._edit(pp.message_id,
+                             "⌛ Время ожидания истекло — вызов отклонён.")
+            mins = SETTINGS.permission_timeout_minutes
+            return ("deny", f"владелец не ответил за {mins} мин — вызов отклонён")
+
+    async def _ask_tool_flow(self, tool_name: str, input_data: dict) -> tuple:
+        loop = asyncio.get_running_loop()
+        pp = PendingPerm(future=loop.create_future(), kind="tool", tool_name=tool_name,
+                         input=input_data or {}, deadline=time.monotonic())
+        pid = STATE.add_perm_prompt(self.chat_id, pp)
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Разрешить", callback_data=f"pm:a:{pid}"),
+            InlineKeyboardButton("❌ Отклонить", callback_data=f"pm:d:{pid}"),
+        ]])
+        text = f"🔐 Claude хочет использовать инструмент:\n\n{tool_name}\n{_perm_preview(input_data)}"
+        try:
+            msg = await self.bot.send_message(chat_id=self.chat_id, text=text, reply_markup=kb)
+        except Exception as e:  # noqa: BLE001 — network, 4096 limit on huge Write…
+            STATE.pop_perm_prompt(self.chat_id, pid)
+            log.warning("perm button send failed: %s", e)
+            return ("deny", f"не удалось спросить владельца в Telegram ({e})")
+        pp.message_id = msg.message_id
+        return await self._wait(pp, pid)
+
+    async def _ask_question_flow(self, input_data: dict) -> tuple:
+        """AskUserQuestion: one button-set per question, answers combined into
+        the {question: label} map the SDK expects."""
+        questions = (input_data or {}).get("questions") or []
+        answers: dict[str, str] = {}
+        loop = asyncio.get_running_loop()
+        for q in questions:
+            qt, labels = _question_parts(q)
+            pp = PendingPerm(future=loop.create_future(), kind="question",
+                             tool_name="AskUserQuestion", input=input_data or {},
+                             question=qt, options=labels,
+                             deadline=time.monotonic())
+            pid = STATE.add_perm_prompt(self.chat_id, pp)
+            rows = [[InlineKeyboardButton(label, callback_data=f"pm:q:{pid}:{j}")]
+                    for j, label in enumerate(labels)]
+            body = "\n".join(f"• {l}" for l in labels)
+            text = _sanitize_perm_text(f"❓ Claude уточняет:\n\n{qt}\n{body}")
+            try:
+                msg = await self.bot.send_message(chat_id=self.chat_id, text=text,
+                                                  reply_markup=InlineKeyboardMarkup(rows))
+            except Exception as e:  # noqa: BLE001
+                STATE.pop_perm_prompt(self.chat_id, pid)
+                log.warning("question button send failed: %s", e)
+                return ("deny", f"не удалось спросить владельца в Telegram ({e})")
+            pp.message_id = msg.message_id
+            verdict, payload = await self._wait(pp, pid)
+            if verdict != "allow":
+                return (verdict, payload)
+            answers[qt] = str(payload)
+        return ("allow", answers)
+
+    async def cancel_all(self) -> None:
+        """/cancel or turn timeout: deny every still-hanging prompt of this
+        chat and rewrite its message, so no zombie button stays tappable."""
+        for pid, pp in list(STATE.perm_prompts.get(self.chat_id, {}).items()):
+            STATE.pop_perm_prompt(self.chat_id, pid)
+            if not pp.future.done():
+                pp.future.set_result(("deny", "ход отменён владельцем"))
+            await self._edit(pp.message_id, "🛑 Отменено (ход прерван).")
+
+
+async def _perm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """pm:a|d|q:<id>[:<opt>] — resolve a ✅/❌/answer tap.
+
+    Ids are MONOTONIC (registry keys), not list indexes: prompts of one turn
+    appear/resolve one by one, and with parallel tool_use an index would shift,
+    making a stale tap resolve someone else's prompt. Unknown/expired id -> a
+    friendly alert (same pattern as note_callback)."""
+    query = update.callback_query
+    chat_id = update.effective_chat.id
+    bot = context.bot  # CallbackQuery has no .bot in this PTB version — CLAUDE.md №10
+    parts = (query.data or "").split(":")
+    op = parts[1] if len(parts) > 1 else ""
+    try:
+        pid = int(parts[2])
+    except (IndexError, ValueError):
+        await query.answer("Кнопка устарела.", show_alert=True)
+        return
+    pp = STATE.get_perm_prompt(chat_id, pid)
+    if pp is None:
+        await query.answer("Запрос уже не активен.", show_alert=True)
+        return
+
+    if op == "a":
+        STATE.pop_perm_prompt(chat_id, pid)
+        if not pp.future.done():
+            pp.future.set_result(("allow", None))
+        await _rerender(query, bot, chat_id,
+                        _sanitize_perm_text(f"✅ {pp.tool_name} — разрешено."), None)
+    elif op == "d":
+        STATE.pop_perm_prompt(chat_id, pid)
+        if not pp.future.done():
+            pp.future.set_result(("deny", "владелец отклонил вызов инструмента"))
+        await _rerender(query, bot, chat_id,
+                        _sanitize_perm_text(f"❌ {pp.tool_name} — отклонено."), None)
+    elif op == "q":
+        try:
+            label = pp.options[int(parts[3])]
+        except (IndexError, ValueError):
+            await query.answer("Вариант не найден.", show_alert=True)
+            return
+        STATE.pop_perm_prompt(chat_id, pid)
+        if not pp.future.done():
+            pp.future.set_result(("allow", label))
+        await _rerender(query, bot, chat_id,
+                        _sanitize_perm_text(f"❓ {pp.question}\n→ {label}"), None)
+    else:
+        await query.answer()
+        return
+    await query.answer()
 
 
 # ---- dictation helpers (/note: voice -> file, no Claude) --------------------
@@ -319,6 +607,29 @@ async def _save_dictation(text: str, folder: str) -> Path:
     return await asyncio.get_running_loop().run_in_executor(None, _write)
 
 
+async def _save_note(bot, chat_id: int, text: str, *, status_msg_id: int | None = None) -> None:
+    """Append text to the daily dictation journal and confirm in chat.
+
+    Shared by voice dictation (status_msg_id: edit its «распознаю…» note in
+    place) and typed dictation (no status message — send a new confirmation).
+    """
+    folder = STATE.get_note_folder(chat_id)
+    try:
+        path = await _save_dictation(text, folder)
+    except ValueError as e:  # noqa: BLE001
+        await bot.send_message(chat_id=chat_id, text=f"⚠️ Не записать в папку «{folder}»: {e}")
+        return
+    # Show the date WITHOUT ".md": Telegram linkifies "<date>.md" as a URL (.md is
+    # a real TLD -> a tap opens a browser trying to resolve it -> DNS error).
+    rel = f"{folder}/{path.stem}"
+    body = f"📝 Записано → {rel}\n\n{text[:800]}"
+    if status_msg_id is not None:
+        await bot.edit_message_text(chat_id=chat_id, message_id=status_msg_id,
+                                    text=body, disable_web_page_preview=True)
+    else:
+        await bot.send_message(chat_id=chat_id, text=body, disable_web_page_preview=True)
+
+
 async def _run_dictation(update: Update, context: ContextTypes.DEFAULT_TYPE, voice) -> None:
     """Transcribe a voice/audio message and append it to the daily .md journal.
 
@@ -360,21 +671,7 @@ async def _run_dictation(update: Update, context: ContextTypes.DEFAULT_TYPE, voi
         await bot.send_message(chat_id=chat_id, text="🎙 Не удалось распознать речь (пустой результат).")
         return
 
-    folder = STATE.get_note_folder(chat_id)
-    try:
-        path = await _save_dictation(text, folder)
-    except ValueError as e:  # noqa: BLE001
-        await bot.send_message(chat_id=chat_id, text=f"⚠️ Не записать в папку «{folder}»: {e}")
-        return
-
-    # Show the date WITHOUT ".md": Telegram linkifies "<date>.md" as a URL (.md is a
-    # real TLD -> a tap opens a browser trying to resolve it -> DNS error).
-    rel = f"{folder}/{path.stem}"
-    await bot.edit_message_text(
-        chat_id=chat_id, message_id=note.message_id,
-        text=f"📝 Записано → {rel}\n\n{text[:800]}",
-        disable_web_page_preview=True,
-    )
+    await _save_note(bot, chat_id, text, status_msg_id=note.message_id)
 
 
 # ---- voice control: local command interception (no Claude) -----------------
@@ -401,6 +698,8 @@ _MODE_SYNONYMS = [
     (["баланс", "балансед", "balanced"], "balanced"),
     (["фулл", "фул", "полная свобода", "полный режим", "полного режима", "полный", "full"], "full"),
     (["стрикт", "строг", "стрит", "только чтение", "strict"], "strict"),
+    # «с подтверждением» deliberately NOT a synonym — it matches ordinary phrases
+    (["ручной", "ручн", "мануал", "manual"], "manual"),
 ]
 
 # verbs that mark "this is a switch command" (vs. a question like "объясни режим")
@@ -533,16 +832,64 @@ def _set_voice_mode(chat_id: int, on: bool) -> str:
     return "🔇 Голосовые ответы ВЫКЛ — ответы только текстом."
 
 
-def _do_new_dialog(chat_id: int) -> str:
+async def _drop_sdk_client(project_name: str) -> None:
+    """Close the project's live SDK client (its process holds the old
+    conversation). Sessions survive — the registry only forgets the process;
+    a later turn reconnects lazily with resume. No-op in subprocess mode."""
+    if SETTINGS.runner != "sdk":
+        return
+    try:
+        import sdk_runner  # lazy: optional dependency
+        await sdk_runner.drop(project_name)
+    except Exception:  # noqa: BLE001
+        log.exception("sdk drop failed for %s", project_name)
+
+
+def _turn_in_progress_reply(chat_id: int, action: str = "Смена проекта") -> str | None:
+    """Refusal text when the chat's current project has a live Claude turn, else None.
+
+    /new and project switching drop the project's live sdk client — mid-turn that
+    kills the running turn (its _drive reader loses the transport). Forbid it and
+    say so right away: the user must see WHY the command did nothing."""
+    try:
+        proj = STATE.project_for_chat(chat_id)
+    except RuntimeError as e:
+        return str(e)
+    if STATE.is_running(proj.name):
+        return (f"⏳ Проект занят: идёт запрос к Claude. {action} сейчас прервёт его — "
+                "дождитесь окончания или /cancel, затем повторите.")
+    return None
+
+
+async def _do_new_dialog(chat_id: int) -> str:
+    """Forget the project's session AND drop its live SDK client: the process
+    keeps the old conversation alive, so a clean start must close it too."""
+    busy = _turn_in_progress_reply(chat_id, "Новый диалог")
+    if busy:
+        # Besides killing the turn, a mid-flight /new would also be undone: the
+        # finishing turn saves its session_id back, resurrecting the "forgotten"
+        # dialog. Refuse while the turn is live.
+        return busy
     proj = STATE.project_for_chat(chat_id)
     STATE.clear_session(proj.name)
+    await _drop_sdk_client(proj.name)
     return f"🆕 Новый диалог для проекта {proj.name}."
 
 
-def _switch_project(chat_id: int, name: str) -> str:
+async def _switch_project(chat_id: int, name: str) -> str:
     candidates = _fuzzy_projects(name)
     if len(candidates) == 1:
+        old_name = STATE.project_for_chat(chat_id).name
+        if candidates[0] != old_name:
+            busy = _turn_in_progress_reply(chat_id)
+            if busy:
+                return busy
         proj = STATE.switch_project(chat_id, candidates[0])
+        if proj.name != old_name:
+            # The registry holds ONE live client (current project): leaving a
+            # project closes its client. Its session id stays in sessions.json,
+            # so returning to it resumes the context (lazy resume).
+            await _drop_sdk_client(old_name)
         return f"📂 Выбран проект {proj.name}."
     if not candidates:
         avail = ", ".join(p.name for p in SETTINGS.projects) or "(нет)"
@@ -553,22 +900,47 @@ def _switch_project(chat_id: int, name: str) -> str:
 
 def _set_mode(chat_id: int, mode: str, confirm: bool) -> tuple[str, bool]:
     """Return (reply_text, needs_full_confirm_button)."""
-    if mode not in ("balanced", "full", "strict"):
-        return ("Режим должен быть: balanced, full или strict", False)
+    if mode not in VALID_MODES:
+        return ("Режим должен быть: balanced, full, strict или manual", False)
     if mode == "full" and not confirm:
         return ("⚠️ *full* отключает ВСЕ проверки прав — Claude сможет выполнять любые команды. "
                 "Подтвердите кнопкой ниже.", True)
     STATE.set_mode(chat_id, mode)
-    return (f"Режим: *{mode}*", False)
+    extra = ""
+    if mode == "manual" and SETTINGS.runner != "sdk":
+        extra = ("\n⚠️ manual полноценно работает только при runner: sdk — "
+                 "в subprocess-режиме почти все инструменты будут отвергаться.")
+    return (f"Режим: *{mode}*{extra}", False)
 
 
-def _do_cancel(chat_id: int) -> str:
+async def _do_cancel(chat_id: int) -> str:
     proj = STATE.project_for_chat(chat_id)
     task = STATE.get_running(proj.name)
     if task and task.proc is not None:
         task.cancelled = True
         _kill_proc_tree(task.proc)
         return "🛑 Отменяю текущий запрос к Claude…"
+    if task and task.active and task.cancel_hook is None:
+        # sdk connect window: the client is still booting, the interrupt hook is
+        # not registered yet. The turn IS running — saying "ничего не выполняется"
+        # would be a lie; be honest that /cancel can't reach it for a few seconds.
+        n = STATE.queue_clear(proj.name)
+        extra = f"\n📬 Из очереди снято: {n}." if n else ""
+        return ("⏳ Запрос ещё поднимается (стартует SDK-сессия) — прервать его пока "
+                "нельзя. Повторите /cancel через несколько секунд." + extra)
+    if task and task.active and task.cancel_hook is not None:
+        # sdk: real interrupt — deny hanging buttons + interrupt(); the turn's
+        # own stream reader consumes the aborted ResultMessage and finishes
+        # promptly (NO drain here — a second reader would steal the terminal
+        # message and hang the turn; see sdk_runner._interrupt_turn).
+        task.cancelled = True
+        await task.cancel_hook()
+        n = STATE.queue_clear(proj.name)
+        extra = f"\n📬 Из очереди снято: {n}." if n else ""
+        return "🛑 Отменяю текущий запрос к Claude (сессия сохранена)…" + extra
+    n = STATE.queue_clear(proj.name)
+    if n:
+        return f"🛑 Из очереди снято: {n}."
     return "Сейчас ничего не выполняется."
 
 
@@ -576,14 +948,16 @@ def _status_text(chat_id: int) -> str:
     proj = STATE.project_for_chat(chat_id)
     mode = STATE.get_mode(chat_id)
     sid = STATE.get_session(proj.name)
-    running = STATE.get_running(proj.name)
     sid_str = (sid[:8] + "…") if sid else "нет"
     lines = [
         f"📂 Проект: {proj.name}",
         f"⚙️ Режим: {mode}",
+        f"🧵 Раннер: {SETTINGS.runner}",
         f"⏸ Пауза: {'да' if STATE.get_pause(chat_id) else 'нет'}",
         f"🧠 Сессия: {sid_str}",
-        f"▶️ Выполняется: {'да' if (running and running.proc is not None) else 'нет'}",
+        # sdk turns have no Popen — without `active` this would always say "нет"
+        f"▶️ Выполняется: {'да' if STATE.is_running(proj.name) else 'нет'}",
+        f"📥 Очередь: {STATE.queue_len(proj.name)}",
     ]
     return "\n".join(lines)
 
@@ -607,9 +981,9 @@ async def _dispatch_voice_command(update: Update, context: ContextTypes.DEFAULT_
         await bot.send_message(chat_id=chat_id,
                                text=f"🔊 Голосовые ответы: {cur_str}. (скажите «голосовые вкл/выкл»)")
     elif intent == "new":
-        await bot.send_message(chat_id=chat_id, text=_do_new_dialog(chat_id))
+        await bot.send_message(chat_id=chat_id, text=await _do_new_dialog(chat_id))
     elif intent == "project":
-        await bot.send_message(chat_id=chat_id, text=_switch_project(chat_id, str(args)))
+        await bot.send_message(chat_id=chat_id, text=await _switch_project(chat_id, str(args)))
     elif intent == "project_list":
         cur = STATE.current.get(chat_id)
         lines = ["*Проекты:*"]
@@ -630,7 +1004,7 @@ async def _dispatch_voice_command(update: Update, context: ContextTypes.DEFAULT_
         else:
             await bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN)
     elif intent == "cancel":
-        await bot.send_message(chat_id=chat_id, text=_do_cancel(chat_id))
+        await bot.send_message(chat_id=chat_id, text=await _do_cancel(chat_id))
     elif intent == "status":
         await bot.send_message(chat_id=chat_id, text=_status_text(chat_id))
     elif intent == "browse_notes":
@@ -812,6 +1186,15 @@ async def cmd_freetext(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         STATE.set_config_pending(chat_id, None)
         await _config_consume_value(update, context, pending)
         return
+    # 📝 Dictation (/note): typed text goes to the journal TOO — same rule as
+    # voice, no Claude. Before the pause gate (like the voice branch in
+    # cmd_voice), so notes can be typed while Claude is paused. Slash-commands
+    # still bypass this (the handler filters commands out).
+    if STATE.get_note_mode(chat_id):
+        text = (update.message.text or "").strip()
+        if text:
+            await _save_note(context.bot, chat_id, text)
+        return
     if STATE.get_pause(chat_id):
         return  # paused: silently ignore free text — only slash-commands are answered
     # 🔊 reply-voice: when on, replying to a bot message speaks THAT message.
@@ -975,11 +1358,7 @@ async def cmd_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    proj = STATE.project_for_chat(chat_id)
-    STATE.clear_session(proj.name)
-    await context.bot.send_message(
-        chat_id=chat_id, text=f"🆕 Новый диалог для проекта {proj.name}.",
-    )
+    await context.bot.send_message(chat_id=chat_id, text=await _do_new_dialog(chat_id))
 
 
 async def cmd_diff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1078,7 +1457,16 @@ async def project_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.answer("Кнопка устарела — откройте /project заново.", show_alert=True)
         return
     proj = SETTINGS.projects[i]
+    old_name = _project_current_name(chat_id)
+    if proj.name != old_name:
+        busy = _turn_in_progress_reply(chat_id)
+        if busy:
+            # Visible right at the tap: the menu stays, an alert explains why.
+            await query.answer(busy, show_alert=True)
+            return
     STATE.switch_project(chat_id, proj.name)  # exact match; KeyError impossible after bounds-check
+    if proj.name != old_name:
+        await _drop_sdk_client(old_name)  # one live client: leaving a project closes its
     await _rerender(query, bot, chat_id, _project_text(chat_id), _project_kb(chat_id))
     await query.answer(f"Выбран {proj.name}")
 
@@ -1097,15 +1485,35 @@ async def cmd_project(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         except (KeyError, ValueError, FileNotFoundError) as e:
             await context.bot.send_message(chat_id=chat_id, text=f"Не удалось добавить: {e}")
             return
+        old_name = _project_current_name(chat_id)
+        if proj.name != old_name:
+            busy = _turn_in_progress_reply(chat_id)
+            if busy:
+                # The project IS added (that part is safe) — only auto-selecting it
+                # waits: switching mid-turn would drop the client under the turn.
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"➕ Добавлен проект {proj.name} (ещё не выбран).\n{busy}")
+                return
         STATE.current[chat_id] = proj.name
+        if proj.name != old_name:
+            await _drop_sdk_client(old_name)
         await context.bot.send_message(chat_id=chat_id, text=f"➕ Добавлен и выбран проект {proj.name}.")
         return
     name = args[0]
     try:
+        old_name = _project_current_name(chat_id)
+        if name != old_name:
+            busy = _turn_in_progress_reply(chat_id)
+            if busy:
+                await context.bot.send_message(chat_id=chat_id, text=busy)
+                return
         proj = STATE.switch_project(chat_id, name)
     except KeyError:
         await context.bot.send_message(chat_id=chat_id, text=f"Нет такого проекта: {name}")
         return
+    if proj.name != old_name:
+        await _drop_sdk_client(old_name)
     await context.bot.send_message(chat_id=chat_id, text=f"📂 Выбран проект {proj.name}.")
 
 
@@ -1116,13 +1524,14 @@ async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await context.bot.send_message(
             chat_id=chat_id,
             text=(f"Текущий режим: *{cur}*\n\nДоступно: balanced (правка кода, блок rm -rf), "
-                  f"full (полная свобода), strict (только чтение).\nСмена: /mode <режим>"),
+                  f"full (полная свобода), strict (только чтение), "
+                  f"manual (каждое действие — кнопка ✅/❌, только sdk).\nСмена: /mode <режим>"),
             parse_mode=ParseMode.MARKDOWN,
         )
         return
     mode = context.args[0].lower()
-    if mode not in ("balanced", "full", "strict"):
-        await context.bot.send_message(chat_id=chat_id, text="Режим должен быть: balanced, full или strict")
+    if mode not in VALID_MODES:
+        await context.bot.send_message(chat_id=chat_id, text="Режим должен быть: balanced, full, strict или manual")
         return
     if mode == "full" and not (len(context.args) > 1 and context.args[1].lower() == "confirm"):
         await context.bot.send_message(
@@ -1133,19 +1542,17 @@ async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
     STATE.set_mode(chat_id, mode)
-    await context.bot.send_message(chat_id=chat_id, text=f"Режим: *{mode}*", parse_mode=ParseMode.MARKDOWN)
+    extra = ""
+    if mode == "manual" and SETTINGS.runner != "sdk":
+        extra = ("\n⚠️ manual полноценно работает только при runner: sdk — "
+                 "в subprocess-режиме почти все инструменты будут отвергаться.")
+    await context.bot.send_message(chat_id=chat_id, text=f"Режим: *{mode}*{extra}",
+                                   parse_mode=ParseMode.MARKDOWN)
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    proj = STATE.project_for_chat(chat_id)
-    task = STATE.get_running(proj.name)
-    if task and task.proc is not None:
-        task.cancelled = True
-        _kill_proc_tree(task.proc)
-        await context.bot.send_message(chat_id=chat_id, text="🛑 Отменяю текущий запрос к Claude…")
-    else:
-        await context.bot.send_message(chat_id=chat_id, text="Сейчас ничего не выполняется.")
+    await context.bot.send_message(chat_id=chat_id, text=await _do_cancel(chat_id))
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1153,7 +1560,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     proj = STATE.project_for_chat(chat_id)
     mode = STATE.get_mode(chat_id)
     sid = STATE.get_session(proj.name)
-    running = STATE.get_running(proj.name)
     cost = STATE.last_cost.get(proj.name)
     # Plain text — no Markdown: proj.path has '_' (C:\_AI\_Claude_Telegramm) which
     # Telegram's Markdown parser rejects as unmatched, so /status would get no reply.
@@ -1162,9 +1568,12 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"📂 Проект: {proj.name}",
         f"📁 {proj.path}",
         f"⚙️ Режим: {mode}",
+        f"🧵 Раннер: {SETTINGS.runner}",
         f"⏸ Пауза: {'да (до /resume)' if STATE.get_pause(chat_id) else 'нет'}",
         f"🧠 Сессия: {sid[:8] + '…' if sid else 'нет (новый)'}",
-        f"▶️ Выполняется: {'да' if (running and running.proc is not None) else 'нет'}",
+        # sdk turns have no Popen — `active` must count too, or this lies "нет"
+        f"▶️ Выполняется: {'да' if STATE.is_running(proj.name) else 'нет'}",
+        f"📥 Очередь: {STATE.queue_len(proj.name)}",
         f"💲 Последний запрос: {('$%.4f' % cost) if cost is not None else '—'}",
     ]
     await context.bot.send_message(chat_id=chat_id, text="\n".join(lines))
@@ -1235,8 +1644,8 @@ def _toggle_text(chat_id: int, key: str) -> str:
                 f"Фрагментов: {n}. /draft show · /draft clear.")
     elif key == "note":
         folder = STATE.get_note_folder(chat_id)
-        body = (f"Голосовые пишутся в dictations/{folder}/ (без Claude)." if on
-                else "Голос снова идёт в Claude как задача.")
+        body = (f"Голосовые и тексты пишутся в dictations/{folder}/ (без Claude)." if on
+                else "Голос и текст снова идут в Claude.")
     else:
         body = spec["on"] if on else spec["off"]
     return f"{head}\n{body}"
@@ -1405,6 +1814,13 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     STATE.set_pause(chat_id, False)
     await context.bot.send_message(chat_id=chat_id, text="▶️ Обработка запросов к Claude возобновлена.")
+    # /pause stops the queue relay; resuming must restart it, or parked
+    # messages would sit until the owner sends something new.
+    try:
+        proj = STATE.project_for_chat(chat_id)
+    except RuntimeError:
+        return
+    _dispatch_queue(proj.name)
 
 
 # ---- /note: dictation (voice -> file, no Claude) ----------------------------
@@ -1436,14 +1852,14 @@ async def cmd_note(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await bot.send_message(
             chat_id=chat_id,
             text=(f"📝 Диктовка ВКЛ.\n"
-                  f"Голосовые теперь пишутся в dictations/{folder}/ (без Claude).\n"
-                  f"/note off — вернуть голос в Claude."),
+                  f"Голосовые и тексты теперь пишутся в dictations/{folder}/ (без Claude).\n"
+                  f"/note off — вернуть голос и текст в Claude."),
         )
         return
 
     if sub in ("off", "выкл", "0", "нет", "no", "false"):
         STATE.set_note_mode(chat_id, False)
-        await bot.send_message(chat_id=chat_id, text="🎙 Диктовка ВЫКЛ — голос снова идёт в Claude.")
+        await bot.send_message(chat_id=chat_id, text="🎙 Диктовка ВЫКЛ — голос и текст снова идут в Claude.")
         return
 
     if sub in ("folder", "папка", "dir"):
@@ -1778,6 +2194,16 @@ CONFIG_FIELDS: list[FieldSpec] = [
     FieldSpec("claudeexe", "Общее", "claude.exe (путь)", "claude_exe", "str", False,
               yaml_path=("claude_exe",),
               help="⚠️ Проверка PATH идёт при старте — нужно перезапустить бота."),
+    FieldSpec("runner", "Общее", "Раннер (исполнитель Claude)", "runner", "enum", False,
+              choices=("subprocess", "sdk"), yaml_path=("runner",),
+              help="sdk — живая сессия: кнопки прав ✅/❌, настоящий /cancel, "
+                   "режим manual, очередь сообщений. ⚠️ Читается при старте — рестарт."),
+    FieldSpec("permto", "Общее", "Таймаут кнопок прав (мин)", "permission_timeout_minutes",
+              "int", True, mn=1, yaml_path=("permission_timeout_minutes",),
+              help="Сколько ждать тапа ✅/❌ до авто-отклонения (sdk)."),
+    FieldSpec("queuemax", "Общее", "Очередь сообщений (шт)", "task_queue_max",
+              "int", True, mn=0, yaml_path=("task_queue_max",),
+              help="Сколько сообщений копится во время хода Claude (sdk). 0 = без очереди."),
     # --- Режимы (modes.<name>.{permission_mode,deny_tools}) ---
     FieldSpec("m_balanced_perm", "Режимы", "balanced: permission_mode",
               "modes:balanced:permission_mode", "mode_perm", True,
@@ -1798,6 +2224,13 @@ CONFIG_FIELDS: list[FieldSpec] = [
     FieldSpec("m_strict_deny", "Режимы", "strict: deny_tools",
               "modes:strict:deny_tools", "tool_list", True,
               yaml_path=("modes", "strict", "deny_tools")),
+    FieldSpec("m_manual_perm", "Режимы", "manual: permission_mode",
+              "modes:manual:permission_mode", "mode_perm", True,
+              choices=_PERM_CHOICES, yaml_path=("modes", "manual", "permission_mode")),
+    FieldSpec("m_manual_deny", "Режимы", "manual: deny_tools",
+              "modes:manual:deny_tools", "tool_list", True,
+              yaml_path=("modes", "manual", "deny_tools"),
+              help="Запрещённые инструменты (режим кнопок ✅/❌)."),
     # --- STT ---
     FieldSpec("sttprov", "STT", "Провайдер STT", "stt_provider", "enum", True,
               choices=("groq", "local"), yaml_path=("stt", "provider")),
@@ -1840,6 +2273,16 @@ CONFIG_FIELDS: list[FieldSpec] = [
 
 CONFIG_FIELDS_BY_KEY: dict[str, FieldSpec] = {f.key: f for f in CONFIG_FIELDS}
 
+# Fields whose LIVE mutation is unsafe, unlike other live=False fields (which
+# only need a restart for their effect but may be setattr'd harmlessly):
+# `runner` decides which code path every _do_claude takes and how the queue
+# behaves — flipping it under a running bot leaves a hybrid state (a queue that
+# nothing dispatches, sdk clients treated by subprocess rules). For these keys
+# /config persists to yaml ONLY; SETTINGS keeps the boot value until restart,
+# and _PENDING_RESTART holds the pending value so the UI shows what's stored.
+_RESTART_ONLY_FIELDS = {"runner"}
+_PENDING_RESTART: dict[str, object] = {}
+
 
 def _group_index(group: str) -> int:
     try:
@@ -1849,6 +2292,8 @@ def _group_index(group: str) -> int:
 
 
 def _config_get(spec: FieldSpec):
+    if spec.key in _PENDING_RESTART:  # a restart-only edit is pending: show the stored value
+        return _PENDING_RESTART[spec.key]
     if spec.attr.startswith("modes:"):
         _, mode, sub = spec.attr.split(":")
         m = SETTINGS.modes.get(mode) or {}
@@ -1953,7 +2398,12 @@ def _config_apply_value(spec: FieldSpec, raw: str, chat_id: int) -> tuple[bool, 
     if spec.attr == "allowed_user_ids" and chat_id not in value:
         return False, "⚠️ Нельзя удалить свой собственный chat_id — иначе вы потеряете доступ к боту."
 
-    _config_set(spec, value)
+    if spec.key in _RESTART_ONLY_FIELDS:
+        # yaml-only (see _RESTART_ONLY_FIELDS): the running bot keeps the boot
+        # value — a mid-flight flip would change turn semantics under live code.
+        _PENDING_RESTART[spec.key] = value
+    else:
+        _config_set(spec, value)
 
     try:
         if spec.secret and spec.env:

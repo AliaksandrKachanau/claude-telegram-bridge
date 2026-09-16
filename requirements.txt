@@ -5,6 +5,12 @@ edge-tts==7.2.8
 httpx==0.28.1
 ruamel.yaml==0.19.1
 
+# Live Claude Agent SDK runner (config.yaml: runner: sdk). ~100 MB wheel —
+# the Claude Code CLI is bundled inside (claude_agent_sdk/_bundled/claude.exe).
+# Installed lazily at runtime: the bot imports and starts fine without it
+# (subprocess runner is the default).
+claude-agent-sdk==0.2.152
+
 # Optional — only for offline voice transcription (config.yaml: stt.provider: local).
 # Install with: .venv\Scripts\pip install faster-whisper
 # faster-whisper

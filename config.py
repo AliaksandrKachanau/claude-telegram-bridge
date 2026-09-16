@@ -22,7 +22,7 @@ ENV_PATH = BASE_DIR / ".env"
 CONFIG_PATH = BASE_DIR / "config.yaml"
 SESSIONS_PATH = BASE_DIR / "sessions.json"
 
-VALID_MODES = ("balanced", "full", "strict")
+VALID_MODES = ("balanced", "full", "strict", "manual")
 
 
 @dataclass(frozen=True)
@@ -43,6 +43,17 @@ class Settings:
     long_output_threshold: int
     modes: dict  # name -> {"permission_mode": str, "deny_tools": list[str]}
     projects: list[Project] = field(default_factory=list)
+    # Which execution backend serves /ask and /task:
+    # - "subprocess": classic `claude -p` per message (claude_runner.py) — default.
+    # - "sdk": live Claude Agent SDK session per project (sdk_runner.py):
+    #   permission buttons in Telegram, real /cancel (interrupt), runtime
+    #   permission-mode switching, message queue. Read at bot start (not live).
+    runner: str = "subprocess"
+    # sdk-runner: minutes a ✅/❌ permission button waits before auto-deny.
+    permission_timeout_minutes: int = 10
+    # sdk-runner: how many messages may queue per project while a turn is
+    # running (beyond that the request is refused, as in subprocess mode).
+    task_queue_max: int = 3
     # speech-to-text
     stt_provider: str = "groq"           # "groq" | "local"
     stt_groq_model: str = "whisper-large-v3"
@@ -134,9 +145,17 @@ def load() -> Settings:
     if default_mode not in VALID_MODES:
         log.warning("default_mode %r invalid, falling back to 'balanced'", default_mode)
         default_mode = "balanced"
+    # manual (sdk-runner: every non-read-only tool behind a ✅/❌ button) is new —
+    # default it in so an older config.yaml keeps working without an edit.
+    modes.setdefault("manual", {"permission_mode": "default", "deny_tools": []})
     for m in VALID_MODES:
         if m not in modes:
             log.warning("mode %r missing from config.modes", m)
+
+    runner = str(cfg.get("runner", "subprocess") or "subprocess")
+    if runner not in ("subprocess", "sdk"):
+        log.warning("runner %r invalid, falling back to 'subprocess'", runner)
+        runner = "subprocess"
 
     projects = _load_projects(cfg.get("projects", []))
     if not projects:
@@ -153,6 +172,9 @@ def load() -> Settings:
         long_output_threshold=int(cfg.get("long_output_threshold_chars", 15000)),
         modes=modes,
         projects=projects,
+        runner=runner,
+        permission_timeout_minutes=int(cfg.get("permission_timeout_minutes", 10)),
+        task_queue_max=int(cfg.get("task_queue_max", 3)),
         stt_provider=str(stt.get("provider", "groq")),
         stt_groq_model=str(stt.get("groq_model", "whisper-large-v3")),
         stt_local_model=str(stt.get("local_model", "small")),

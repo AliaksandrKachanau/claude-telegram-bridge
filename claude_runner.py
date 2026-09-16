@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import subprocess
 import sys
 import uuid
@@ -124,6 +125,40 @@ def _kill_proc_tree(proc: ProcLike) -> None:
         log.warning("proc.kill() failed: %s", e)
 
 
+def _sanitize_child_env() -> dict:
+    """Child env without ANTHROPIC_LOG: with it set (left over in the launching
+    shell), the CLI's SDK prints HTTP debug dumps to STDOUT — the same stream as
+    the --output-format json result — and the JSON stops parsing. Belt on top of
+    the bot.py startup scrub, so smoke runs and direct imports are covered too."""
+    return {k: v for k, v in os.environ.items() if k != "ANTHROPIC_LOG"}
+
+
+def _extract_result_json(text: str) -> Optional[dict]:
+    """Parse the CLI's JSON result, tolerating stdout noise around it.
+
+    `claude -p --output-format json` prints one compact JSON line, but stray
+    output can share the stream (ANTHROPIC_LOG dumps, banners, warnings). A
+    whole-text json.loads fails on that, so fall back to scanning lines from the
+    END for a JSON object that looks like a run result."""
+    try:
+        data = json.loads(text)
+        return data if isinstance(data, dict) else None
+    except json.JSONDecodeError:
+        pass
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict) and any(
+                k in data for k in ("result", "session_id", "subtype", "is_error")):
+            return data
+    return None
+
+
 def _run_sync(
     argv: list[str],
     cwd: str,
@@ -146,6 +181,7 @@ def _run_sync(
             encoding="utf-8",
             errors="replace",
             creationflags=creationflags,
+            env=_sanitize_child_env(),
         )
     except FileNotFoundError:
         log.error("claude executable not found: %s", settings.claude_exe)
@@ -174,10 +210,13 @@ def _run_sync(
     text_out = (stdout or "").strip()
     err_out = (stderr or "").strip()
 
-    try:
-        data = json.loads(text_out)
-    except json.JSONDecodeError:
-        raw = text_out or err_out or "Нет вывода от claude."
+    data = _extract_result_json(text_out)
+    if data is None:
+        # Diagnostics: errors live at the END of the output — the old
+        # head-of-output truncation hid the real reason behind debug noise.
+        tail = f"{text_out}\n--- stderr ---\n{err_out}".strip()[-4000:]
+        log.error("claude: вывод не разобран как JSON (хвост вывода):\n%s", tail)
+        raw = tail or "Нет вывода от claude."
         return ClaudeResult(ok=False, text=raw[:4000], error="non-json")
 
     if data.get("is_error"):

@@ -13,7 +13,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from config import SESSIONS_PATH, Project, Settings
 
@@ -25,9 +25,57 @@ _BOT_TEXT_MAX = 50
 
 @dataclass
 class RunningTask:
-    """Tracks the live Claude process of the currently-running request, for /cancel."""
-    proc: object  # subprocess.Popen
+    """Tracks the live Claude work of the currently-running request, for /cancel.
+
+    ``proc`` is set by the classic subprocess runner (Popen of `claude -p`);
+    ``cancel_hook``/``active`` by the sdk runner. In sdk mode ``proc`` is always
+    None, so "is something running" checks must consult ``active`` as well —
+    otherwise /status and the voice status lie "nothing is running" (proc-only
+    check was the pre-sdk behaviour).
+    """
+    proc: object = None                    # subprocess.Popen (subprocess runner)
     cancelled: bool = False
+    active: bool = False                   # True while an sdk turn is in flight
+    cancel_hook: Optional[Callable[[], Awaitable[None]]] = None  # sdk interrupt wrapper
+
+
+@dataclass
+class TaskQueueItem:
+    """A message parked while a Claude turn is running (sdk runner only).
+
+    Holds the original ``update``/``context`` so the dispatched item replies in
+    the right chat — the queue is per PROJECT, and a project can in principle
+    be driven from more than one chat.
+    """
+    chat_id: int
+    prompt: str
+    is_task: bool
+    speak_reply: bool
+    update: Any = None      # telegram Update (for _do_claude; only .effective_chat used)
+    context: Any = None     # telegram CallbackContext (for .bot)
+
+
+@dataclass
+class PendingPerm:
+    """One ✅/❌ permission prompt awaiting the owner's tap (sdk runner).
+
+    ``future`` resolves to ("allow", payload) or ("deny", message); payload is
+    the {question: label} answer map for AskUserQuestion and None otherwise.
+    Buttons carry ``pm:<id>`` with a MONOTONIC id — not a list index: prompts
+    of one turn are added/resolved one by one, and with parallel tool_use an
+    index would shift, making a stale tap resolve someone else's prompt.
+    """
+    future: asyncio.Future
+    kind: str                 # "tool" | "question"
+    tool_name: str
+    input: dict
+    question: str = ""        # AskUserQuestion headline (kind == "question")
+    options: list = field(default_factory=list)  # option labels (kind == "question")
+    message_id: Optional[int] = None
+    deadline: float = 0.0     # monotonic expiry. NOT read by the current code
+                              # (auto-deny is asyncio.wait_for in _TelegramPermUI._wait);
+                              # kept for a future reaper sweeping prompts orphaned
+                              # by a crashed turn.
 
 
 @dataclass
@@ -87,6 +135,11 @@ class State:
         self.config_unlock: dict[int, float] = {}   # chat_id -> monotonic deadline
         self.config_pending: dict[int, str] = {}    # chat_id -> CONFIG_FIELDS key
         self.config_msg_id: dict[int, int] = {}     # chat_id -> active /config inline message id
+        # sdk runner: parked messages per project while a turn is running (ж),
+        # and the registry of live ✅/❌ permission prompts per chat.
+        self.task_queue: dict[str, list[TaskQueueItem]] = {}  # project -> FIFO
+        self.perm_prompts: dict[int, dict[int, PendingPerm]] = {}  # chat_id -> id -> prompt
+        self._perm_seq: int = 0  # monotonic id for pm:<id> callbacks
         self._load_sessions()
 
     # ---- projects ----
@@ -172,6 +225,52 @@ class State:
 
     def clear_running(self, project_name: str) -> Optional[RunningTask]:
         return self.running.pop(project_name, None)
+
+    def is_running(self, project_name: str) -> bool:
+        """True if a Claude request is in flight — subprocess (proc) OR sdk (active)."""
+        t = self.running.get(project_name)
+        return bool(t) and (t.proc is not None or t.active)
+
+    # ---- message queue (sdk runner only; subprocess keeps the busy refusal) ----
+    def queue_push(self, project_name: str, item: TaskQueueItem) -> Optional[int]:
+        """Park a message while a turn is running. Returns its 1-based position,
+        or None when the queue is already at settings.task_queue_max (refuse,
+        same as the old busy message)."""
+        q = self.task_queue.setdefault(project_name, [])
+        if len(q) >= self.settings.task_queue_max:
+            return None
+        q.append(item)
+        return len(q)
+
+    def queue_pop(self, project_name: str) -> Optional[TaskQueueItem]:
+        q = self.task_queue.get(project_name)
+        if not q:
+            return None
+        return q.pop(0)
+
+    def queue_len(self, project_name: str) -> int:
+        return len(self.task_queue.get(project_name) or [])
+
+    def queue_clear(self, project_name: str) -> int:
+        """Drop all queued messages for a project (/cancel). Returns how many."""
+        q = self.task_queue.pop(project_name, None)
+        return len(q) if q else 0
+
+    # ---- ✅/❌ permission prompts (sdk runner, callback_data `pm:<id>`) ----
+    def add_perm_prompt(self, chat_id: int, pp: PendingPerm) -> int:
+        """Register a pending prompt; returns its new monotonic id."""
+        self._perm_seq += 1
+        self.perm_prompts.setdefault(chat_id, {})[self._perm_seq] = pp
+        return self._perm_seq
+
+    def get_perm_prompt(self, chat_id: int, pid: int) -> Optional[PendingPerm]:
+        return self.perm_prompts.get(chat_id, {}).get(pid)
+
+    def pop_perm_prompt(self, chat_id: int, pid: int) -> Optional[PendingPerm]:
+        return self.perm_prompts.get(chat_id, {}).pop(pid, None)
+
+    def pending_perms(self, chat_id: int) -> list[PendingPerm]:
+        return list(self.perm_prompts.get(chat_id, {}).values())
 
     # ---- mode ----
     def get_mode(self, chat_id: int) -> str:

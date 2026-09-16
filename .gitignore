@@ -18,3 +18,8 @@ desktop.ini
 
 # Editor
 .obsidian/
+
+# Local Claude Code session data (settings.local.json with machine-specific
+# allow rules) and local planning notes — never for the public repo.
+.claude/
+plans/

@@ -4,7 +4,16 @@
 claude_exe: "C:\\Users\\Aliaksandr\\.local\\bin\\claude.exe"
 # model intentionally omitted — auth/model already configured on the host
 
-default_mode: balanced        # balanced | full | strict
+# Execution backend for /ask and /task. Read at bot start (needs a restart to change).
+#   subprocess — classic `claude -p` per message (default, battle-tested).
+#   sdk        — live Claude Agent SDK session: permission buttons ✅/❌ in
+#               Telegram, real /cancel, runtime /mode switching, message queue,
+#               mode `manual`. Switch to `sdk` after a live test if you want it.
+runner: sdk
+permission_timeout_minutes: 10  # sdk: minutes a ✅/❌ button waits before auto-deny
+task_queue_max: 3               # sdk: queue cap per project while a turn runs
+
+default_mode: balanced        # balanced | full | strict | manual
 timeout_minutes: 15
 max_budget_usd: 2.0           # hard per-call USD cap (--max-budget-usd) — the REAL guardrail
 max_turns: 30                 # passed but NOT guaranteed by CLI 2.1.183 — do not rely on it
@@ -48,6 +57,11 @@ modes:
     deny_tools:
     - "Edit"
     - "Write"
+  manual:
+    permission_mode: default   # sdk only: read-only tools run freely, EVERYTHING
+    deny_tools: []             # else (Bash/Edit/Write/WebFetch/...) asks via ✅/❌
+                              # buttons. In subprocess mode manual degrades
+                              # (headless default-mode denies almost everything).
 
 # Projects Claude can work in. Add more at runtime via /project add <path>
 # or by editing this list. The "bot" project points at this bridge itself.

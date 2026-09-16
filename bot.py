@@ -93,6 +93,16 @@ def main() -> None:
     _setup_logging()
     log = logging.getLogger("bot")
 
+    # ANTHROPIC_LOG=debug left in the launching shell makes the Claude CLI's
+    # SDK print HTTP debug dumps to STDOUT — the same stream as the
+    # --output-format json result — so JSON parsing breaks and the user gets a
+    # debug dump instead of the (successfully generated) answer. The bot never
+    # wants it; scrub before any child process inherits it.
+    if os.environ.get("ANTHROPIC_LOG"):
+        log.warning("ANTHROPIC_LOG=%s в окружении — убираю (ломает JSON-stdout claude)",
+                    os.environ["ANTHROPIC_LOG"])
+        os.environ.pop("ANTHROPIC_LOG", None)
+
     if not _acquire_single_instance():
         msg = ("Bot is already running — a second instance refuses to start to avoid "
                "a Telegram 409 conflict and claude.json corruption. "
@@ -240,6 +250,18 @@ def main() -> None:
                 log.info("Incumbent — clean polling established; will not defer to contenders.")
                 return
 
+    async def _post_shutdown(application) -> None:
+        # Close live SDK clients (runner: sdk) so the bundled claude.exe doesn't
+        # outlive the bot. Helps on GRACEFUL shutdown only — a hard kill still
+        # leaks the process, which is why stop_bot.bat also sweeps the bundled
+        # CLI by command line. Lazy import: sdk_runner must be importable when
+        # the claude-agent-sdk package is absent (subprocess mode).
+        try:
+            import sdk_runner
+            await sdk_runner.close_all()
+        except Exception:  # noqa: BLE001 — shutdown must never fail here
+            log.exception("sdk close_all on shutdown failed")
+
     async def _post_init(application) -> None:
         # First thing the owner sees after a (re)start: status + command cheatsheet.
         # Sent IMMEDIATELY via a RETRYING background task (network may be down at logon):
@@ -274,7 +296,8 @@ def main() -> None:
                 log.warning("health notify to %s failed: %s", uid, e)
 
     auth = authorized(settings)
-    app = Application.builder().token(settings.token).post_init(_post_init).build()
+    app = (Application.builder().token(settings.token)
+           .post_init(_post_init).post_shutdown(_post_shutdown).build())
     app.add_error_handler(_on_error)
 
     app.add_handler(CommandHandler("start", auth(C.cmd_start)))
@@ -315,6 +338,9 @@ def main() -> None:
     # Inline buttons for /project switching (callback_data "pj:<i>" — index into
     # the configured projects list).
     app.add_handler(CallbackQueryHandler(auth(C.project_callback), pattern=r"^pj:"))
+    # Inline ✅/❌ buttons for SDK permission prompts (callback_data
+    # "pm:<op>:<id>[:<opt>]" — monotonic registry id, NOT a list index).
+    app.add_handler(CallbackQueryHandler(auth(C._perm_callback), pattern=r"^pm:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, auth(C.cmd_freetext)))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, auth(C.cmd_voice)))
 
