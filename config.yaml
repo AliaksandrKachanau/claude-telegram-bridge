@@ -71,3 +71,15 @@ projects:
   # Example — uncomment and set a real path to add another project:
   # - name: main
   #   path: "C:\\_AI\\SomeProject"
+
+# Second bot: MT5 terminal monitor (mt5bot\mt5_bot.py, token MT5_BOT_TOKEN in .env).
+# Attaches to the RUNNING terminal; MetaTrader5 pip package needs the terminal
+# on THIS machine. Phase 1 = read-only monitoring; trading commands come in
+# phase 2 behind allow_trading.
+mt5:
+  terminal_path: "C:\\Program Files\\BOSSAFX 5\\terminal64.exe"  # attach to this one
+  allow_trading: false        # phase 2; trading commands stay disabled while false
+  poll_sec: 2
+  margin_warn_pct: 200        # warn once below, re-arm above +50 (hysteresis)
+  notify: { placement: true, fill: true, close: true, cancel: false }
+  shot_timeout_sec: 10        # phase 3 (screenshots)

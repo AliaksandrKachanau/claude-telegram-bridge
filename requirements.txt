@@ -14,3 +14,8 @@ claude-agent-sdk==0.2.152
 # Optional — only for offline voice transcription (config.yaml: stt.provider: local).
 # Install with: .venv\Scripts\pip install faster-whisper
 # faster-whisper
+
+# Second bot: MT5 terminal monitor (mt5bot\). Windows-only; attaches to the
+# running MetaTrader 5 terminal via IPC. Pulls in numpy. Not needed on machines
+# that run only the Claude bot (mt5_monitor imports it lazily).
+MetaTrader5==5.0.6180

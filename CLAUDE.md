@@ -63,6 +63,47 @@ Telegram-бот (python-telegram-bot, async) на Windows, через котор
 `transcribe.transcribe()` → как задача. Голосовой вывод: `_speak_answer()` →
 Edge TTS → ffmpeg → `send_voice`.
 
+**Второй бот: MT5-монитор (`mt5bot\`).** Независимый процесс со своим токеном
+`MT5_BOT_TOKEN` (guard: пустой или равный `TELEGRAM_BOT_TOKEN` → отказ старта;
+mutex + incumbent-guard как у claude-бота), наблюдает за терминалом MetaTrader 5
+(bossaFX): события placement/fill/close+reason/margin + `/mt5status|/mt5orders|
+/mt5positions` (полные токены — тап в Telegram шлёт команду целиком; аргумент
+после пробела в автоссылку не попадает; меню команд — `set_my_commands` в
+`post_init`; короткая форма `/mt5 <sub>` тоже работает). Кнопки — двумя
+видами: (а) **reply-клавиатура** внизу чата (`ReplyKeyboardMarkup`,
+`is_persistent` — ставится уже стартовым сообщением `post_init`, тап шлёт текст
+кнопки → `MessageHandler` по ТОЧНОМУ лейблу, `filters.Regex` с `^…$`); (б)
+голый `/mt5` — **inline-пульт**: тап рендерит ответ **в том же сообщении**
+(`edit_message_text` с `reply_markup`; грабли: `CallbackQuery` без `.bot` →
+`context.bot`, «message is not modified» = норма, не ошибка). Списки — с
+inline-кнопкой **на каждый элемент**: тап → карточка с действием →
+подтверждение ✅/❌ → исполнение (callback-цепочка `m5pos:/m5ord:<ticket>` →
+`m5cl:/m5dl:` → `m5cly:/m5dly:`; все тапы — один `m5_callback`, pattern `^m5`).
+Торговые методы (`close_position`/`delete_pending`) — за ДВОЙНЫМ гейтом:
+`allow_trading` (yaml, пока false; в карточке элемента кнопки действий при
+выключенном флаге НЕ показываются) + `terminal_info().trade_allowed` (внятный
+10027), filling перебирается при 10030. Уведомления — через asyncio-очередь
+с пампом ретраев (сбой отправки НЕ теряет событие: штампы сделок/защёлки
+margin двигаются при детекте). Фаза 1 = чтение + действия над
+существующими объектами;
+план и фазы —
+`..\_BrokerPolski\_BOSSA\_MT5\Plan_TelegramBridgeMT5.md`. Инварианты: живёт
+целиком в `mt5bot\` (код + свои bats + `logs\mt5bot.log`), из корня берёт только
+`security.py`/`messages.py` (sys.path-шим в `mt5_bot.py`); НЕ импортирует
+claude_runner/sdk_runner/projects — ни claude.exe, ни локов, ни `~/.claude.json`.
+Все вызовы `MetaTrader5` — синхронное IPC → только `asyncio.to_thread` под
+`threading.Lock` (не блокировать event-loop). Текст в чат — plain. Stop-фильтры
+двух ботов строго взаимоисключающие (`\bbot\.py\b` / `mt5_bot\.py` — имя
+`mt5_bot.py` СОДЕРЖИТ подстроку `bot.py`). Дифф событий — только после baseline
+(старт/реконнект = снимок без уведомлений, иначе шторм). Терминал обязан быть
+на той же машине (IPC-attach); пакет `MetaTrader5` в requirements (Windows-only).
+**`mt5.initialize(path=...)` ЗАПУСКАЕТ закрытый терминал** (с живыми EA!) —
+поэтому `_attach` сначала гейтит по процессу (`_running_image_paths`,
+Toolhelp32): attach только к уже работающему, закрытый — ждать, не запускать
+(гейт обязателен и при ПУСТОМ terminal_path — тогда по любому запущенному
+terminal64.exe, т.к. initialize без пути тоже умеет запускать).
+Смоук без Telegram: `PYTHONUTF8=1 SMOKE=attach python mt5bot\mt5_bot.py`.
+
 **SDK-раннер** (`runner: sdk`): один живой `ClaudeSDKClient` на проект,
 поднимается лениво и живёт между ходами (контекст — в сессии, не в `--resume` на
 каждое сообщение). Нужные настройки: `runner`, `permission_timeout_minutes`

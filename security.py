@@ -20,9 +20,13 @@ def authorized(settings: Settings):
             user = update.effective_user
             uid = getattr(user, "id", None)
             if uid is None or uid not in settings.allowed_user_ids:
+                # Updates without a message (e.g. an inline-button tap by a
+                # stranger) have text None — slicing it would raise TypeError
+                # inside the log call itself.
+                text = getattr(getattr(update, "message", None), "text", None)
                 log.warning("rejected update from user_id=%s username=%s text=%r",
                             uid, getattr(user, "username", None),
-                            getattr(getattr(update, "message", None), "text", None)[:80])
+                            text[:80] if text else None)
                 return
             return await handler(update, context)
         return wrapper

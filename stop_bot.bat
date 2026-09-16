@@ -5,6 +5,11 @@ REM how it was started: run_bot.bat, the autostart task (run_autostart.vbs), or 
 REM background shell. Detection-by-command-line is needed because taskkill can only
 REM filter by image name, and other python processes may exist on this PC.
 REM
+REM The pattern is STRICT (\bbot\.py\b, word boundaries): the repo also hosts
+REM the MT5 monitor (mt5bot\mt5_bot.py) which CONTAINS the substring "bot.py" —
+REM a loose match would kill the neighbor bot. \b does not match between "_"
+REM and "b", so mt5_bot.py is safe while "python -u bot.py" is caught.
+REM
 REM Additionally kills the Claude Agent SDK's bundled CLI
 REM (claude_agent_sdk\_bundled\claude.exe) that the sdk runner spawned: a hard
 REM python kill orphans it (the SDK only reaps it on a graceful disconnect).
@@ -15,7 +20,7 @@ REM carries the pattern text in its own command line, so a cmdline-only filter
 REM would match (and kill) the sweeper itself.
 setlocal enableextensions
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$p = Get-CimInstance Win32_Process -Filter \"Name='python.exe' OR Name='pythonw.exe'\" | Where-Object { $_.CommandLine -match 'bot\.py' }; if (-not $p) { Write-Host 'Bot is not running.' } else { $p | ForEach-Object { Write-Host ('Stopping PID ' + $_.ProcessId + ' (' + $_.Name + ')'); try { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop } catch {} }; Write-Host 'Bot stopped.' }"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$p = Get-CimInstance Win32_Process -Filter \"Name='python.exe' OR Name='pythonw.exe'\" | Where-Object { $_.CommandLine -match '\bbot\.py\b' }; if (-not $p) { Write-Host 'Bot is not running.' } else { $p | ForEach-Object { Write-Host ('Stopping PID ' + $_.ProcessId + ' (' + $_.Name + ')'); try { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop } catch {} }; Write-Host 'Bot stopped.' }"
 
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$p = Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and $_.Name -eq 'claude.exe' -and $_.CommandLine -match 'claude_agent_sdk._bundled' }; if (-not $p) { Write-Host 'No orphaned SDK claude.exe.' } else { $p | ForEach-Object { Write-Host ('Stopping bundled SDK CLI PID ' + $_.ProcessId + ' (' + $_.Name + ')'); try { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop } catch {} }; Write-Host 'SDK CLI stopped.' }"
 
