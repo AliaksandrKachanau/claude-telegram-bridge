@@ -14,7 +14,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import subprocess
 import threading
+import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -107,12 +110,13 @@ class Mt5Disconnected(Exception):
     """A poll found the terminal/IPC gone; the loop re-attaches."""
 
 
-def _running_image_paths(exe_name: str) -> set[str]:
-    """Full image paths of running processes whose exe FILE NAME matches.
+def _toolhelp_procs(exe_name: str) -> list[tuple[int, str]]:
+    """(pid, full image path) of running processes whose exe FILE NAME matches.
 
-    Used as the never-launch gate: mt5.initialize(path=...) would START a
-    closed terminal (and its EAs) — the monitor must only ATTACH to a running
-    one. Toolhelp32 + QueryFullProcessImageNameW, no extra dependencies.
+    Toolhelp32 + QueryFullProcessImageNameW, no extra dependencies. Powers the
+    never-launch gate (mt5.initialize(path=...) would START a closed terminal
+    with live EAs — the monitor only ever ATTACHes to a running one) and the
+    terminal power commands (find the exact PIDs to close/launch-check).
     """
     import ctypes
     from ctypes import wintypes
@@ -129,8 +133,8 @@ def _running_image_paths(exe_name: str) -> set[str]:
     k32 = ctypes.windll.kernel32
     snap = k32.CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
     if snap in (-1, 0):
-        return set()
-    paths: set[str] = set()
+        return []
+    out: list[tuple[int, str]] = []
     try:
         entry = PROCESSENTRY32W()
         entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
@@ -143,12 +147,23 @@ def _running_image_paths(exe_name: str) -> set[str]:
                     buf = ctypes.create_unicode_buffer(1024)
                     size = wintypes.DWORD(1024)
                     if k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
-                        paths.add(buf.value)
+                        out.append((entry.th32ProcessID, buf.value))
                     k32.CloseHandle(h)
             ok = k32.Process32NextW(snap, ctypes.byref(entry))
     finally:
         k32.CloseHandle(snap)
-    return paths
+    return out
+
+
+def _running_image_paths(exe_name: str) -> set[str]:
+    return {p for _, p in _toolhelp_procs(exe_name)}
+
+
+def _running_image_pids(exe_name: str, full_path: str | None = None) -> set[int]:
+    """PIDs of the exe; with full_path — only that exact image (case-insens.)."""
+    want = full_path.lower() if full_path else None
+    return {pid for pid, p in _toolhelp_procs(exe_name)
+            if want is None or p.lower() == want}
 
 
 def _vol(v: float) -> str:
@@ -166,11 +181,19 @@ class Monitor:
         self._stopped = False
         self._attached = False
         self._down_notified = False
+        self._had_gap = False            # saw Mt5Disconnected since last summary
         self._baselined = False          # first snapshot is state, not events
         self._known_orders: set[int] = set()
         self._last_deal_ms: int = 0
         self._margin_warned = False
         self._digits: dict[str, int] = {}
+        # Symbols the terminal has been working with (orders/positions/deals,
+        # accumulating) — feeds the screenshot picker; the pip package has no
+        # charts_get, so open-chart symbols are approximated from trade data.
+        self._seen_symbols: set[str] = set()
+        # Serializes file-protocol rounds (shots + discovery): they share the
+        # GRE_shot_cmd.txt mailbox and the sandbox cleanup globs.
+        self._round_lock = threading.Lock()
 
     # ---- lifecycle ---------------------------------------------------------
 
@@ -202,7 +225,8 @@ class Monitor:
                             self._down_notified = True
                             await self._notify(
                                 "📴 Терминал MT5 недоступен (не запущен или нет связи) — "
-                                "переподключаюсь каждые 5 с. Закрытый терминал сам не запускаю.")
+                                "переподключаюсь каждые 5 с. Закрытый терминал сам не "
+                                "запускаю. Включить: /mt5on (или пульт /mt5 → ⏻ Терминал).")
                         await asyncio.sleep(5.0)
                         continue
                     self._attached = True
@@ -211,14 +235,27 @@ class Monitor:
                     self._baseline(snap)
                     # ONE message per reconnect: the header folds the
                     # "reconnected" notice into the fresh baseline summary.
-                    was_down = self._down_notified
+                    # _had_gap counts brief IPC blips (disconnect caught while
+                    # the process stayed up) so their reconnect summary also
+                    # says "restored" + missed deals, not a fake fresh start.
+                    was_down = self._down_notified or self._had_gap
                     self._down_notified = False
+                    self._had_gap = False
                     extra = (f"\n💼 За время простоя произошло сделок: {missed} "
                              "(подробности — в истории терминала)."
                              if was_down and missed else "")
                     header = "📡 Подключение восстановлено." if was_down else ""
                     await self._notify(self._summary(snap, header, extra))
                     self._baselined = True
+                    # Phase 3: chart discovery right after attach — the picker
+                    # starts complete (every GRE_Shot chart reports itself),
+                    # no «снимок по всем графикам» needed just to see symbols.
+                    try:
+                        syms = await asyncio.to_thread(self.discover_charts)
+                        if syms:
+                            log.info("chart discovery: %s", ", ".join(syms))
+                    except Exception:  # noqa: BLE001 — never stall the loop
+                        log.exception("chart discovery failed")
                     continue
                 snap = await asyncio.to_thread(self._snapshot)
             except Mt5Disconnected:
@@ -226,6 +263,7 @@ class Monitor:
                 # re-baselines, so the outage gap never replays as events).
                 self._attached = False
                 self._baselined = False
+                self._had_gap = True
                 await asyncio.to_thread(self._shutdown_mt5)
                 # Hot-loop guard: while the terminal process is up but the
                 # server link is down, _attach succeeds in ~10 ms and the
@@ -284,9 +322,14 @@ class Monitor:
                 return False
             if mt5.account_info() is None:
                 # attached to the IPC but the account/trade connection is not
-                # up yet (terminal still starting or not logged in) — treat as
-                # not attached; initialize() again on the next attempt is fine.
+                # up yet (terminal still starting or not logged in) — drop the
+                # half-open attach so the next attempt starts from a clean
+                # initialize() instead of stacking IPC connections.
                 log.warning("mt5 attached but account_info is None: %s", mt5.last_error())
+                try:
+                    mt5.shutdown()
+                except Exception:  # noqa: BLE001
+                    pass
                 return False
             return True
 
@@ -322,13 +365,14 @@ class Monitor:
             positions = {p.ticket: p for p in positions_raw}
             deals = self._new_deals_locked()
             # price digits cache (symbol_info is IPC too — prefetch in-thread)
-            symbols = set(orders and {o.symbol for o in orders.values()} or set())
+            symbols = {o.symbol for o in orders.values()}
             symbols |= {p.symbol for p in positions.values()}
             symbols |= {d.symbol for d in deals if d.symbol}
             for sym in symbols:
                 if sym and sym not in self._digits:
                     si = mt5.symbol_info(sym)
                     self._digits[sym] = getattr(si, "digits", 0) or 0
+            self._seen_symbols |= {s for s in symbols if s}
             return {"orders": orders, "positions": positions, "deals": deals,
                     "acc": acc, "term": term}
 
@@ -436,7 +480,8 @@ class Monitor:
 
     def _offline_text(self) -> str:
         return ("📴 Терминал MT5 недоступен (не запущен или нет связи со счётом) — "
-                "переподключаюсь. Повтори команду позже.")
+                "переподключаюсь. Повтори команду позже. Если терминал выключен — "
+                "включить: /mt5on.")
 
     def status_text(self) -> str:
         if not MT5_AVAILABLE:
@@ -543,6 +588,245 @@ class Monitor:
         header, items = self.positions_data()
         return header + "\n\n" + "\n\n".join(b for _, b, _ in items) if items else header
 
+    # ---- screenshots (phase 3: GRE_Shot indicator, nonce protocol) ---------
+
+    @staticmethod
+    def _sym_of_shot(name: str) -> str:
+        # GREshot_<sym>_<nonce>.png -> sym (nonce is the last _-chunk)
+        return name[len("GREshot_"):-len(".png")].rsplit("_", 1)[0]
+
+    def take_shots(self, symbol: str = "") -> list[tuple[str, bytes]]:
+        # One file-protocol round at a time (shots and discovery share the
+        # command mailbox and the cleanup globs).
+        with self._round_lock:
+            return self._take_shots(symbol)
+
+    def _take_shots(self, symbol: str = "") -> list[tuple[str, bytes]]:
+        """Ask every GRE_Shot instance (one per chart) for a screenshot.
+
+        Protocol (plan, phase 3): write "<nonce> [sym]" into
+        FILE_COMMON\\GRE_shot_cmd.txt (the folder shared by all terminals —
+        the only meeting point; ChartScreenShot itself can only write into
+        the terminal's own MQL5\\Files sandbox). Each indicator instance
+        latches a new nonce and ChartScreenShot()s its chart to
+        GREshot_<sym>_<nonce>.png. We poll for those PNGs, read + delete
+        them, and drop the command file at the end (mailbox cleanup).
+
+        Runs in a worker thread; the MT5 lock is held only for the quick
+        data_path fetch — the wait loop must not stall the monitor poll.
+        Returns [(symbol, png_bytes), ...]; empty = offline or no GRE_Shot.
+        """
+        if not MT5_AVAILABLE:
+            return []
+        with self._lock:
+            if not self._usable_locked():
+                return []
+            term = mt5.terminal_info()
+        data_path = getattr(term, "data_path", "") if term is not None else ""
+        if not data_path:
+            return []
+        symbol = (symbol or "").strip().upper()
+        common = (Path(os.environ.get("APPDATA", "")) / "MetaQuotes" / "Terminal"
+                  / "Common" / "Files")
+        files_dir = Path(data_path) / "MQL5" / "Files"
+        # fresh round: drop leftovers of any previous request first
+        for old in files_dir.glob("GREshot_*.png"):
+            try:
+                old.unlink()
+            except OSError:
+                pass
+        nonce = uuid.uuid4().hex[:8]
+        cmd = common / "GRE_shot_cmd.txt"
+        tmp = common / "GRE_shot_cmd.tmp"
+        # os.replace can hit PermissionError for a sub-millisecond window while
+        # a GRE_Shot instance holds the cmd file open (MQL5 opens it WITHOUT
+        # FILE_SHARE_DELETE) — retry before giving up. UnicodeEncodeError (a
+        # ValueError: non-ascii /mt5shot <symbol>) must not escape as a crash.
+        # BYTES, not write_text: text mode on Windows translates \n -> \r\n,
+        # turning our "\r\n" into "\r\r\n"; the trailing \r then leaked into
+        # the PNG filename on the MQL5 side and the shot could never be found.
+        payload = f"{nonce} {symbol}".strip().encode("ascii") + b"\r\n"
+        for attempt in range(3):
+            try:
+                tmp.write_bytes(payload)
+                os.replace(tmp, cmd)
+                break
+            except (OSError, ValueError) as e:
+                if attempt == 2:
+                    log.warning("shot command write failed: %s", e)
+                    return []
+                time.sleep(0.1)
+        deadline = time.monotonic() + max(2.0, self.cfg.shot_timeout_sec)
+        shots: dict[str, tuple[str, bytes]] = {}
+        last_fresh = time.monotonic()
+        while time.monotonic() < deadline:
+            time.sleep(0.4)
+            fresh = False
+            for p in sorted(files_dir.glob(f"GREshot_*_{nonce}.png")):
+                if p.name in shots:
+                    continue
+                try:
+                    # age guard: let the terminal finish writing the PNG
+                    if time.time() - p.stat().st_mtime < 0.3:
+                        continue
+                    shots[p.name] = (self._sym_of_shot(p.name), p.read_bytes())
+                    p.unlink(missing_ok=True)
+                    fresh = True
+                except OSError:
+                    pass
+            # 2.0 s (not less): a chart whose OnTimer was delayed past the pack
+            # (busy terminal) still lands inside the window — a tighter gap
+            # would declare "stable" and drop its shot.
+            if shots and not fresh and time.monotonic() - last_fresh >= 2.0:
+                break  # stable: everyone who would answer has answered
+            if fresh:
+                last_fresh = time.monotonic()
+        # Second chance: on a busy box a PNG can become visible on disk a
+        # moment AFTER the stable-break (write-behind / antivirus lag — seen
+        # live 16.09: one chart's file materialised past the round end and its
+        # photo was lost). One extra poll after a short pause rescues it into
+        # THIS round instead of silently deleting it with the stragglers.
+        if shots:
+            time.sleep(1.5)
+            for p in sorted(files_dir.glob(f"GREshot_*_{nonce}.png")):
+                if p.name in shots:
+                    continue
+                try:
+                    if time.time() - p.stat().st_mtime < 0.3:
+                        continue
+                    shots[p.name] = (self._sym_of_shot(p.name), p.read_bytes())
+                    p.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        # Stragglers: a chart whose answer landed AFTER the stable-break (or at
+        # the deadline) is unread — its PNG must not linger on disk until the
+        # next round; "delete after send" starts with "delete after collect".
+        for p in files_dir.glob("GREshot_*.png"):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        try:
+            cmd.unlink()
+        except OSError:
+            pass
+        # Feed the picker: every symbol that ANSWERED is a shootable chart.
+        # This is how a chart without open orders (e.g. the second symbol of
+        # the EA) enters the menu after the first «все графики» round and stays.
+        if shots:
+            with self._lock:
+                self._seen_symbols |= {s for s, _ in shots.values() if s}
+        return list(shots.values())
+
+    def discover_charts(self) -> list[str]:
+        """Ask every GRE_Shot chart to identify itself («<nonce> ?» round).
+
+        Each instance answers with a tiny GREalive_<sym>_<nonce>.txt in its
+        sandbox instead of a screenshot — discovery is instant and cheap, and
+        it feeds _seen_symbols so the picker lists every chart that actually
+        carries GRE_Shot, without waiting for a full «все графики» round.
+        Runs at every attach (the menu starts complete) and from the menu's
+        «🔄 Обновить список» button. Same mailbox/cleanup contract as shots.
+        """
+        if not MT5_AVAILABLE:
+            return []
+        with self._round_lock:
+            with self._lock:
+                if not self._usable_locked():
+                    return []
+                term = mt5.terminal_info()
+            data_path = getattr(term, "data_path", "") if term is not None else ""
+            if not data_path:
+                return []
+            common = (Path(os.environ.get("APPDATA", "")) / "MetaQuotes" / "Terminal"
+                      / "Common" / "Files")
+            files_dir = Path(data_path) / "MQL5" / "Files"
+            for old in files_dir.glob("GREalive_*.txt"):
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+            nonce = uuid.uuid4().hex[:8]
+            cmd = common / "GRE_shot_cmd.txt"
+            tmp = common / "GRE_shot_cmd.tmp"
+            payload = f"{nonce} ?\r\n".encode("ascii")
+            for attempt in range(3):
+                try:
+                    tmp.write_bytes(payload)
+                    os.replace(tmp, cmd)
+                    break
+                except (OSError, ValueError) as e:
+                    if attempt == 2:
+                        log.warning("alive command write failed: %s", e)
+                        return []
+                    time.sleep(0.1)
+            found: set[str] = set()
+            seen: set[str] = set()
+            deadline = time.monotonic() + 6.0  # answers are txt files: fast
+            last_fresh = time.monotonic()
+            while time.monotonic() < deadline:
+                time.sleep(0.4)
+                fresh = False
+                for p in sorted(files_dir.glob(f"GREalive_*_{nonce}.txt")):
+                    if p.name in seen:
+                        continue
+                    try:
+                        if time.time() - p.stat().st_mtime < 0.3:
+                            continue
+                        seen.add(p.name)
+                        sym = p.name[len("GREalive_"):-len(".txt")].rsplit("_", 1)[0]
+                        if sym:
+                            found.add(sym)
+                        p.unlink(missing_ok=True)
+                        fresh = True
+                    except OSError:
+                        pass
+                if seen and not fresh and time.monotonic() - last_fresh >= 2.0:
+                    break
+                if fresh:
+                    last_fresh = time.monotonic()
+            for p in files_dir.glob("GREalive_*.txt"):
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+            try:
+                cmd.unlink()
+            except OSError:
+                pass
+            if found:
+                with self._lock:
+                    self._seen_symbols |= found
+            return sorted(found)
+
+    def sweep_shots(self) -> None:
+        """Delete leftover GREshot PNGs (the bot calls this after sending the
+        photos — catches files written during the sending window)."""
+        if not MT5_AVAILABLE:
+            return
+        with self._lock:
+            if not self._usable_locked():
+                return
+            term = mt5.terminal_info()
+        data_path = getattr(term, "data_path", "") if term is not None else ""
+        if not data_path:
+            return
+        for p in (Path(data_path) / "MQL5" / "Files").glob("GREshot_*.png"):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+
+    def chart_symbols(self) -> list[str]:
+        """Symbols for the screenshot picker: everything the terminal has been
+        trading (orders/positions/deals since the bot started) PLUS every
+        symbol that ever answered with a shot (each round adds its charts —
+        so charts without open orders show up too). The pip package has no
+        charts_get, so open charts are approximated this way; the «все
+        графики» button always covers the rest."""
+        with self._lock:
+            return sorted(self._seen_symbols)
+
     # ---- trading (phase 2 core; every action double-gated) ------------------
 
     RETCODE_HINT = {
@@ -642,8 +926,8 @@ class Monitor:
                 ok = (f"✅ {p.symbol} {'BUY' if is_buy else 'SELL'} {_vol(p.volume)} "
                       f"закрыта{px} (ордер №{getattr(res, 'order', '?')})")
                 return self._send_result(res, ok)
-            except Exception as e:  # noqa: BLE001 — a tap must always get an answer
-                log.warning("close_position(%s) failed: %s", ticket, e)
+            except Exception:  # noqa: BLE001 — a tap must always get an answer
+                log.exception("close_position(%s) failed", ticket)
                 return "❌ Связь с терминалом оборвалась — повтори действие."
 
     def delete_pending(self, ticket: int) -> str:
@@ -669,6 +953,118 @@ class Monitor:
                       f"{ORDER_TYPE_LABEL.get(o.type, f'T{o.type}')} "
                       f"{_vol(o.volume_current)} №{ticket}")
                 return self._send_result(res, ok)
-            except Exception as e:  # noqa: BLE001 — a tap must always get an answer
-                log.warning("delete_pending(%s) failed: %s", ticket, e)
+            except Exception:  # noqa: BLE001 — a tap must always get an answer
+                log.exception("delete_pending(%s) failed", ticket)
                 return "❌ Связь с терминалом оборвалась — повтори действие."
+
+    # ---- terminal power (EXPLICIT user command only) -------------------------
+    # This deliberately crosses the never-launch line of _attach — but only by
+    # an explicit owner action from Telegram (a confirming tap), never by the
+    # monitor's own logic: the AUTO gate ("attach only to a running terminal")
+    # above stays untouched. Killing the terminal stops the EA's management of
+    # open positions until it is started again — hence the confirm screen.
+
+    def _power_gate(self) -> str | None:
+        """Refusal text for power commands; None = allowed to proceed."""
+        if not self.cfg.terminal_path:
+            return ("⛔ В config.yaml не задан mt5.terminal_path — управлять "
+                    "питанием можно только конкретным терминалом (укажи путь "
+                    "и перезапусти бота).")
+        if not self.cfg.allow_trading:
+            return ("⛔ Управление терминалом выключено (mt5.allow_trading: false "
+                    "в config.yaml) — включи флаг и перезапусти бота.")
+        return None
+
+    def terminal_running(self) -> bool:
+        """Is the configured terminal process up? (process scan, no IPC — safe
+        to call even when the monitor is detached)."""
+        if not self.cfg.terminal_path:
+            return bool(_running_image_paths("terminal64.exe"))
+        want = str(Path(self.cfg.terminal_path).resolve()).lower()
+        return any(p.lower() == want
+                   for p in _running_image_paths(Path(self.cfg.terminal_path).name))
+
+    def open_counts(self) -> tuple[int, int] | None:
+        """(positions, pending) for the shutdown warning; None = offline."""
+        if not MT5_AVAILABLE:
+            return None
+        with self._lock:
+            if not self._usable_locked():
+                return None
+            plist = mt5.positions_get()
+            olist = mt5.orders_get()
+            if plist is None or olist is None:
+                return None
+            return (len(plist), sum(1 for o in olist if o.type in PENDING_TYPES))
+
+    def shutdown_terminal(self) -> str:
+        """Close the terminal gracefully (WM_CLOSE to its windows — like the X
+        button: MT5 saves its state and stops the EAs); if nothing exits within
+        15 s (a modal dialog is holding it), hard-kill as the last resort.
+        Runs in a worker thread (blocking waits)."""
+        gate = self._power_gate()
+        if gate:
+            return gate
+        exe = Path(self.cfg.terminal_path)
+        want = str(exe.resolve()).lower()
+        if not _running_image_pids(exe.name, want):
+            return "Терминал уже выключен."
+        if _close_windows_of(_running_image_pids(exe.name, want)):
+            for _ in range(15):
+                time.sleep(1.0)
+                if not _running_image_pids(exe.name, want):
+                    return ("✅ Терминал закрыт. Монитор продолжит следить; "
+                            "включить потом — /mt5on.")
+        # Still alive (modal dialog / hung): TerminateProcess on the survivors.
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        for pid in _running_image_pids(exe.name, want):
+            h = k32.OpenProcess(0x0001, False, pid)  # PROCESS_TERMINATE
+            if h:
+                k32.TerminateProcess(h, 1)
+                k32.CloseHandle(h)
+        time.sleep(1.0)
+        if not _running_image_pids(exe.name, want):
+            return "✅ Терминал закрыт (принудительно — мягкое закрытие не ответило за 15 с)."
+        return ("❌ Не удалось закрыть терминал — посмотри, не висит ли на нём "
+                "диалоговое окно, и закрой вручную.")
+
+    def launch_terminal(self) -> str:
+        """Start the terminal (explicit user command; the same exe, the same
+        profile — the EA resumes). The monitor re-attaches on its own within
+        its 5-s retry and sends the reconnect summary."""
+        gate = self._power_gate()
+        if gate:
+            return gate
+        if self.terminal_running():
+            return "Терминал уже запущен — монитор подключён (или подключится сам)."
+        try:
+            subprocess.Popen([self.cfg.terminal_path],
+                             cwd=str(Path(self.cfg.terminal_path).parent),
+                             close_fds=True)
+        except OSError as e:
+            return f"❌ Не удалось запустить терминал: {e}"
+        return ("🚀 Терминал запускается... монитор подключится сам и пришлёт "
+                "резюме (до ~30 с на старт и вход в аккаунт).")
+
+
+def _close_windows_of(pids: set[int]) -> int:
+    """Post WM_CLOSE to every visible window of the PIDs (a graceful app
+    close — the Windows equivalent of clicking X). Returns posts made."""
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+    posted = 0
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def on_window(hwnd, _lparam):
+        nonlocal posted
+        pid = wintypes.DWORD(0)
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value in pids and user32.IsWindowVisible(hwnd):
+            if user32.PostMessageW(hwnd, 0x0010, 0, 0):  # WM_CLOSE
+                posted += 1
+        return True
+
+    user32.EnumWindows(on_window, 0)
+    return posted

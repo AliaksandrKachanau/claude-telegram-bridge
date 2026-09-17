@@ -17,6 +17,7 @@ import random
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -99,15 +100,22 @@ class _ConflictState:
 
 
 _HELP = ("🤖 MT5-бот (фаза 1 — наблюдение + действия над элементами):\n"
-         "Кнопки внизу чата (📊 ⏳ 📋) — всегда доступны; вернут /start-ом.\n"
+         "Кнопки внизу чата (📊 ⏳ 📋 📸 ⏻) — всегда доступны; вернут /start-ом.\n"
          "/mt5 — пульт с обновлением на месте\n"
          "/mt5status — терминал, счёт, margin\n"
          "/mt5orders — pending-ордера\n"
          "/mt5positions — позиции с P&L\n"
+         "/mt5shot — меню выбора графика для снимка (нужен индикатор GRE_Shot "
+         "на графике; несколько графиков — несколько снимков; /mt5shot BTCUSD — "
+         "сразу только указанный символ). Список символов бот собирает сам при "
+         "подключении (опрос «кто жив?»), кнопка «🔄 Обновить список» в меню "
+         "переспрашивает\n"
          "Тап по позиции/ордеру в списке — карточка с действиями: закрыть по "
          "рынку / удалить pending (с подтверждением ✅). Торговые действия "
          "работают при mt5.allow_trading: true в config.yaml.\n"
-         "/mt5 <status|orders|positions> — то же, для набора руками\n"
+         "/mt5on · /mt5off — включить/выключить терминал (за тем же флагом; "
+         "выключение — с подтверждением, советник приостановится до включения)\n"
+         "/mt5 <status|orders|positions|chart|term|off|on> — то же, для набора руками\n"
          "/help — эта справка\n"
          "\nУведомления: выставление pending, fill, закрытие (TP/SL/EXPERT + "
          "профит), margin level. Отмены pending не шлются (шумно).")
@@ -188,12 +196,27 @@ def main() -> None:
     # the separation is LAYOUT: one full-width button per row — three distinct
     # strips instead of three cells squeezed side by side on a narrow screen.
     MENU_BTNS = {"📊 Статус": "status", "⏳ Ордера": "orders", "📋 Позиции": "positions"}
+    SHOT_BTN = "📸 График"  # phase 3: screenshot request -> GRE_Shot indicator
+    TERM_BTN = "⏻ Терминал"  # power: status screen (on/off itself stays behind ✅)
     m5_rk = ReplyKeyboardMarkup(
-        [[KeyboardButton(t)] for t in MENU_BTNS],  # one per row = full width
+        [[KeyboardButton(t)] for t in MENU_BTNS]  # one per row = full width
+        + [[KeyboardButton(SHOT_BTN)],
+           [KeyboardButton(TERM_BTN)]],
         resize_keyboard=True, is_persistent=True)
     m5_kb = InlineKeyboardMarkup(
         [[InlineKeyboardButton(t, callback_data=f"m5:{sub}")]  # one per row too
-         for t, sub in MENU_BTNS.items()])
+         for t, sub in MENU_BTNS.items()]
+        + [[InlineKeyboardButton(SHOT_BTN, callback_data="m5:chart")],
+           [InlineKeyboardButton("⏻ Терминал", callback_data="m5:term")]])
+    # Typed aliases ("/mt5 ордера") normalize to the canonical sub so EVERY
+    # path renders through _list_view (LIST_CAP + per-item buttons): a raw
+    # *_text() reply bypasses the cap and with a big EA grid exceeds the
+    # Telegram 4096 limit — the send fails and the answer silently never comes.
+    _SUB_ALIASES = {"статус": "status", "ордера": "orders", "pending": "orders",
+                    "позиции": "positions", "pos": "positions", "помощь": "help",
+                    "график": "chart", "снимок": "chart",
+                    "терминал": "term", "выкл": "off", "выключить": "off",
+                    "вкл": "on", "включить": "on"}
 
     cs = _ConflictState(yield_grace=random.uniform(_YIELD_GRACE_MIN, _YIELD_GRACE_MAX))
     _bg_tasks: set = set()
@@ -231,6 +254,13 @@ def main() -> None:
                         delay = min(delay * 2, 60.0)
             _notify_q.task_done()
 
+    def _pump_died(t: asyncio.Task) -> None:
+        # Everything inside the pump is wrapped in its own except-clauses;
+        # this observer catches a death OUTSIDE them (a bug) — otherwise the
+        # queue would keep growing with zero delivery, silently.
+        if not t.cancelled() and t.exception() is not None:
+            log.error("notify pump died: %r", t.exception())
+
     monitor = M.Monitor(cfg, _notify)
 
     async def _reply(update, text: str) -> None:
@@ -253,13 +283,11 @@ def main() -> None:
         await _reply(update, _HELP)
 
     async def _mt5_answer(sub: str) -> str:
-        if sub in ("status", "статус"):
+        # Only text-only screens live here: lists MUST go through _list_view
+        # (LIST_CAP + per-item buttons) — aliases normalize in _view first.
+        if sub == "status":
             return await asyncio.to_thread(monitor.status_text)
-        if sub in ("orders", "ордера", "pending"):
-            return await asyncio.to_thread(monitor.orders_text)
-        if sub in ("positions", "позиции", "pos"):
-            return await asyncio.to_thread(monitor.positions_text)
-        if sub in ("help", "помощь"):
+        if sub == "help":
             return _HELP
         return f"Не знаю «{sub}». Доступно: /mt5status · /mt5orders · /mt5positions · /help"
 
@@ -316,11 +344,19 @@ def main() -> None:
                 InlineKeyboardMarkup([action, nav_row]))
 
     async def _confirm_view(kind: str, ticket: int):
+        if not cfg.allow_trading:
+            # A stale action button from a past session (flag since turned
+            # off) must refuse HERE — not walk the user through ✅ and fail
+            # only after confirmation. The monitor-side gate holds regardless.
+            return ("⛔ Торговые действия выключены (mt5.allow_trading: false в "
+                    "config.yaml) — кнопка из старого сообщения больше не действует.",
+                    _nav_kb())
         blk, offline = await _find_block("ord" if kind == "dl" else "pos", ticket)
         if offline:
             return offline, _nav_kb()
         if blk is None:
-            return "Объект уже не существует — обнови список.", _nav_kb()
+            noun = "Ордер" if kind == "dl" else "Позиция"
+            return f"{noun} №{ticket} уже не существует — обнови список.", _nav_kb()
         if kind == "cl":
             verb, yes, back = "закрыть ПО РЫНКУ", f"m5cly:{ticket}", f"m5pos:{ticket}"
         else:
@@ -343,7 +379,8 @@ def main() -> None:
             nav_row])
 
     async def _view(sub: str):
-        """(text, keyboard) for every screen; text-only subs get just the nav."""
+        """(text, keyboard) for every screen; aliases normalize to canonical."""
+        sub = _SUB_ALIASES.get(sub, sub)
         if sub in ("orders", "positions"):
             return await _list_view(sub)
         return await _mt5_answer(sub), _nav_kb()
@@ -353,12 +390,121 @@ def main() -> None:
         await update.effective_message.reply_text(
             text, reply_markup=kb, disable_web_page_preview=True)
 
+    # ---- chart picker (which symbol to screenshot) + terminal power ------
+
+    async def _chart_menu_view():
+        """Symbol picker for screenshots: «все графики» + one button per symbol
+        the terminal has been trading (approximation — the pip package has no
+        charts_get). Photos arrive as new messages either way."""
+        syms = await asyncio.to_thread(monitor.chart_symbols)
+        rows = [[InlineKeyboardButton("📸 Все графики", callback_data="m5:ch:*")]]
+        rows += [[InlineKeyboardButton(f"📸 {s}", callback_data=f"m5:ch:{s}")]
+                 for s in syms]
+        rows.append([InlineKeyboardButton("🔄 Обновить список", callback_data="m5:charts")])
+        rows.append(nav_row)
+        if syms:
+            text = ("📸 Какой график снять?\nСимволы терминала: "
+                    + ", ".join(syms))
+        else:
+            text = ("📸 Какой график снять?\n\nСписок символов пуст — терминал, "
+                    "похоже, выключен (включить: /mt5on); кнопка «Все графики» "
+                    "сработает после включения.")
+        return text, InlineKeyboardMarkup(rows)
+
+    async def _send_chart_menu(update, context) -> None:
+        text, kb = await _chart_menu_view()
+        chat_id = (update.effective_chat.id if update.effective_chat
+                   else getattr(update.effective_user, "id", None))
+        if chat_id is None:
+            return
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=text,
+                                           reply_markup=kb,
+                                           disable_web_page_preview=True)
+        except Exception:  # noqa: BLE001
+            log.warning("chart menu send failed")
+
+    async def _term_status_view():
+        running = await asyncio.to_thread(monitor.terminal_running)
+        state = "🟢 запущен" if running else "🔴 выключен"
+        rows = []
+        if cfg.allow_trading and cfg.terminal_path:
+            if running:
+                rows.append([InlineKeyboardButton("🔴 Выключить терминал",
+                                                  callback_data="m5:termoff")])
+            else:
+                rows.append([InlineKeyboardButton("🟢 Включить терминал",
+                                                  callback_data="m5:termon")])
+        rows.append(nav_row)
+        text = (f"⏻ Терминал\nСостояние: {state}\n"
+                f"Путь: {cfg.terminal_path or '(не задан — управление недоступно)'}")
+        if not cfg.allow_trading:
+            text += "\n\n⛔ Управление питанием выключено (mt5.allow_trading: false)."
+        elif not cfg.terminal_path:
+            text += "\n\n⛔ Управление питанием требует mt5.terminal_path в config.yaml."
+        return text, InlineKeyboardMarkup(rows)
+
+    async def _term_confirm_view():
+        if not cfg.allow_trading:
+            # A stale ✅-button from an old message must refuse HERE (same
+            # pattern as the trade confirmations).
+            return ("⛔ Управление терминалом выключено (mt5.allow_trading: false в "
+                    "config.yaml) — кнопка из старого сообщения больше не действует.",
+                    _nav_kb())
+        counts = await asyncio.to_thread(monitor.open_counts)
+        warn = ""
+        if counts:
+            pos, pend = counts
+            if pos or pend:
+                warn = (f"\n⚠️ Открыто позиций: {pos}, pending: {pend} — пока "
+                        "терминал выключен, советник ими НЕ управляет (TP/SL "
+                        "остаются на сервере и продолжают работать).")
+        text = ("Точно ВЫКЛЮЧИТЬ терминал?" + warn
+                + "\nМонитор пришлёт 📡-резюме, когда ты снова его включишь (/mt5on).")
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Выключаю", callback_data="m5:termoffy")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="m5:term")],
+            nav_row])
+        return text, kb
+
+    async def _term_exec_view(kind: str):
+        if kind == "off":
+            result = await asyncio.to_thread(monitor.shutdown_terminal)
+        else:
+            result = await asyncio.to_thread(monitor.launch_terminal)
+        return result, InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Обновить статус", callback_data="m5:term")],
+            nav_row])
+
+    async def _send_screen(update, context, view) -> None:
+        """Typed command entry (no inline message to edit): render as new."""
+        text, kb = await view()
+        await update.effective_message.reply_text(
+            text, reply_markup=kb, disable_web_page_preview=True)
+
     # Full-command aliases (/mt5status etc.) exist because Telegram auto-links
     # only the /token up to the first space — an argument after a space is NOT
     # part of the tap, so "/mt5 status" can never be sent by tapping it.
     async def cmd_mt5(update, context) -> None:
-        if context.args:  # typed form: /mt5 status|orders|positions
-            await _send_view(update, context.args[0].lower())
+        if context.args:  # typed form: /mt5 status|orders|positions|chart|term|off|on
+            sub = _SUB_ALIASES.get(context.args[0].lower(), context.args[0].lower())
+            if sub == "chart":
+                sym = context.args[1] if len(context.args) > 1 else ""
+                if sym:
+                    await _shot_flow(update, context, sym)
+                else:
+                    await _send_chart_menu(update, context)
+                return
+            if sub == "term":
+                await _send_screen(update, context, _term_status_view)
+                return
+            if sub == "off":
+                await _send_screen(update, context, _term_confirm_view)
+                return
+            if sub == "on":
+                await _send_screen(update, context, lambda: _term_exec_view("on"))
+                return
+            await _send_view(update, sub)
         else:  # bare /mt5 -> the inline panel (refresh-in-place mode)
             await update.effective_message.reply_text(
                 "🎛 Пульт наблюдения MT5 — тапни кнопку:",
@@ -367,7 +513,17 @@ def main() -> None:
     async def m5_menu_text(update, context) -> None:
         # A persistent-keyboard tap arrives as a plain message whose text is
         # exactly the button label — route it to the same views.
-        sub = MENU_BTNS.get((update.effective_message.text or "").strip())
+        text = (update.effective_message.text or "").strip()
+        if text == SHOT_BTN:
+            await _send_chart_menu(update, context)
+            return
+        if text == TERM_BTN:
+            # Opens the STATUS screen only — the shutdown itself still walks
+            # the inline ✅-confirmation chain, so a stray bottom-keyboard tap
+            # can never kill the terminal.
+            await _send_screen(update, context, _term_status_view)
+            return
+        sub = MENU_BTNS.get(text)
         if sub:
             await _send_view(update, sub)
 
@@ -398,6 +554,77 @@ def main() -> None:
         except Exception:  # noqa: BLE001
             log.warning("view fallback send failed")
 
+    # ---- phase 3: chart screenshots (GRE_Shot indicator on the charts) ----
+
+    _shot_lock = asyncio.Lock()  # one round at a time: the cmd file and the
+    # PNG cleanup are shared, so overlapping rounds (double-tap during the
+    # up-to-10-s wait) would eat each other's nonce and photos.
+
+    async def _shot_flow(update, context, symbol: str = "") -> None:
+        """Request screenshots and send them as photos (a new message flow:
+        an inline screen cannot be edited into a photo)."""
+        chat_id = (update.effective_chat.id if update.effective_chat
+                   else getattr(update.effective_user, "id", None))
+        if chat_id is None:
+            return
+        if _shot_lock.locked():
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id, text="⏳ Снимок уже делается — подожди.")
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        async with _shot_lock:
+            label = f" ({symbol})" if symbol else ""
+            status = await context.bot.send_message(
+                chat_id=chat_id, text=f"📸 Делаю снимок графика{label}…")
+            try:
+                shots = await asyncio.to_thread(monitor.take_shots, symbol)
+            except Exception:  # noqa: BLE001 — a tap must always get an answer
+                log.exception("take_shots failed")
+                shots = []
+            sent = False
+            for sym, png in shots:
+                try:
+                    await context.bot.send_photo(
+                        chat_id=chat_id, photo=png,
+                        caption=f"📸 {sym} · {datetime.now():%d.%m %H:%M:%S}")
+                    sent = True
+                except Exception as e:  # noqa: BLE001
+                    log.warning("send_photo failed: %s", e)
+            if sent:
+                try:
+                    await status.delete()
+                except Exception:  # noqa: BLE001
+                    pass
+            else:
+                try:
+                    await status.edit_text(
+                        "❌ Снимок не получен. Проверь, что индикатор GRE_Shot "
+                        "повешен на график (и терминал запущен — выключен? "
+                        "/mt5on) — см. README, раздел MT5.")
+                except Exception:  # noqa: BLE001 — never hang the status text
+                    log.warning("shot status edit failed")
+            # Delete-after-send, literally: a PNG written while the photos were
+            # already going out must not linger on disk until the next round.
+            try:
+                await asyncio.to_thread(monitor.sweep_shots)
+            except Exception:  # noqa: BLE001
+                log.warning("shot sweep failed")
+
+    async def cmd_mt5shot(update, context) -> None:
+        sym = context.args[0] if context.args else ""
+        if sym:
+            await _shot_flow(update, context, sym)
+        else:
+            await _send_chart_menu(update, context)
+
+    async def cmd_mt5off(update, context) -> None:
+        await _send_screen(update, context, _term_confirm_view)
+
+    async def cmd_mt5on(update, context) -> None:
+        await _send_screen(update, context, lambda: _term_exec_view("on"))
+
     async def m5_callback(update, context) -> None:
         q = update.callback_query
         data = q.data or ""
@@ -406,12 +633,33 @@ def main() -> None:
         except Exception:  # noqa: BLE001 — e.g. answered late by the client
             pass
         try:
-            if data.startswith("m5:"):
-                sub = data.split(":", 1)[1]
-                if sub in ("orders", "positions"):
-                    text, kb = await _list_view(sub)
-                else:
-                    text, kb = await _mt5_answer(sub), _nav_kb()
+            if data == "m5:chart":
+                # The picker itself is a text screen — it CAN edit in place;
+                # the photos it leads to cannot (new messages).
+                text, kb = await _chart_menu_view()
+            elif data == "m5:charts":
+                # Discovery round («кто жив?»): every GRE_Shot chart reports
+                # itself with a tiny txt file — no screenshots taken. Exact
+                # match BEFORE the m5:ch: prefix branch ("m5:charts" would
+                # otherwise parse as symbol "arts").
+                await asyncio.to_thread(monitor.discover_charts)
+                text, kb = await _chart_menu_view()
+            elif data.startswith("m5:ch:"):
+                # m5:ch:* = all charts; m5:ch:<SYM> = one symbol. Photos are
+                # NEW messages: answer and leave the menu on screen.
+                sym = data[len("m5:ch:"):]
+                await _shot_flow(update, context, "" if sym == "*" else sym)
+                return
+            elif data == "m5:term":
+                text, kb = await _term_status_view()
+            elif data == "m5:termoff":
+                text, kb = await _term_confirm_view()
+            elif data == "m5:termoffy":
+                text, kb = await _term_exec_view("off")
+            elif data == "m5:termon":
+                text, kb = await _term_exec_view("on")
+            elif data.startswith("m5:"):
+                text, kb = await _view(data.split(":", 1)[1])
             elif data.startswith("m5pos:"):
                 text, kb = await _item_card("pos", int(data[6:]))
             elif data.startswith("m5ord:"):
@@ -428,6 +676,9 @@ def main() -> None:
                 text, kb = "Неизвестная кнопка.", None
         except ValueError:
             text, kb = "Не понял номер (тикет) в кнопке.", None
+        except Exception:  # noqa: BLE001 — a tap must always get an answer
+            log.exception("m5_callback render failed")
+            text, kb = "❌ Ошибка чтения терминала — повтори тап.", _nav_kb()
         await _edit_or_send(update, q, context, text, kb)
 
     async def cmd_mt5status(update, context) -> None:
@@ -446,10 +697,13 @@ def main() -> None:
                  "списки работают, закрыть/удалить нельзя.")
         return ("🤖 MT5-бот запущен (фаза 1 — наблюдение + действия над элементами).\n"
                 f"Терминал: {cfg.terminal_path or 'attach к любому запущенному'}\n"
-                "Кнопки внизу чата: статус · ордера · позиции (вернут /start-ом)\n"
+                "Кнопки внизу чата: статус · ордера · позиции · график · терминал "
+                "(вернут /start-ом)\n"
                 "Тап по позиции/ордеру в списке — действия с подтверждением.\n"
+                "Питание терминала: /mt5on · /mt5off (⏻ — внизу чата и в пульте /mt5).\n"
                 f"{trade}\n"
-                "Команды: /mt5status · /mt5orders · /mt5positions · /help")
+                "Команды: /mt5status · /mt5orders · /mt5positions · /mt5shot · "
+                "/mt5on · /mt5off · /help")
 
     async def _notify_startup(application, text: str) -> None:
         # Retries: at logon the network may be down for a while (as in bot.py).
@@ -537,7 +791,10 @@ def main() -> None:
                 BotCommand("mt5status", "терминал, счёт, margin"),
                 BotCommand("mt5orders", "pending-ордера"),
                 BotCommand("mt5positions", "позиции с P&L"),
-                BotCommand("mt5", "кнопки: статус/ордера/позиции"),
+                BotCommand("mt5shot", "меню снимка графика (нужен GRE_Shot)"),
+                BotCommand("mt5on", "включить терминал"),
+                BotCommand("mt5off", "выключить терминал (с подтверждением)"),
+                BotCommand("mt5", "кнопки: статус/ордера/позиции/график/терминал"),
                 BotCommand("help", "справка"),
             ])
         except Exception as e:  # noqa: BLE001 — cosmetic, must not block start
@@ -545,6 +802,7 @@ def main() -> None:
         t0 = asyncio.create_task(_notify_pump())
         _bg_tasks.add(t0)
         t0.add_done_callback(_bg_tasks.discard)
+        t0.add_done_callback(_pump_died)
         t1 = asyncio.create_task(_notify_startup(application, await _startup_text()))
         _bg_tasks.add(t1)
         t1.add_done_callback(_bg_tasks.discard)
@@ -554,6 +812,15 @@ def main() -> None:
         await monitor.start()  # attach happens inside the loop; notifies by itself
 
     async def _post_shutdown(application) -> None:
+        # Best-effort drain FIRST, while the pump is still alive: events
+        # queued before the stop get a few seconds to leave; anything left is
+        # logged instead of being dropped silently.
+        try:
+            await asyncio.wait_for(_notify_q.join(), timeout=5.0)
+        except asyncio.TimeoutError:
+            if _notify_q.qsize():
+                log.warning("shutdown: %d уведомление(й) не доставлено",
+                            _notify_q.qsize())
         for t in list(_bg_tasks):  # no "Task was destroyed but it is pending"
             t.cancel()
         await monitor.stop()
@@ -568,7 +835,12 @@ def main() -> None:
     app.add_handler(CommandHandler("mt5status", auth(cmd_mt5status)))
     app.add_handler(CommandHandler("mt5orders", auth(cmd_mt5orders)))
     app.add_handler(CommandHandler("mt5positions", auth(cmd_mt5positions)))
-    # All inline taps of the пульт (m5:<sub>), the item lists (m5pos:/m5ord:)
+    app.add_handler(CommandHandler("mt5shot", auth(cmd_mt5shot)))
+    app.add_handler(CommandHandler("mt5off", auth(cmd_mt5off)))
+    app.add_handler(CommandHandler("mt5on", auth(cmd_mt5on)))
+    # All inline taps of the пульт (m5:<sub>), the item lists (m5pos:/m5ord:),
+    # the chart picker (m5:chart -> m5:ch:<sym>|* — photos as new messages),
+    # the terminal power chain (m5:term -> m5:termoff -> m5:termoffy / m5:termon)
     # and the trade actions with confirmation (m5cl:/m5cly:/m5dl:/m5dly:).
     # auth() works as-is: it checks update.effective_user, which CallbackQuery
     # updates carry too.
@@ -577,8 +849,23 @@ def main() -> None:
     # not affected: a CommandHandler only matches strings starting with "/".
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND
-        & filters.Regex(r"^(📊 Статус|⏳ Ордера|📋 Позиции)$"),
+        & filters.Regex(r"^(📊 Статус|⏳ Ордера|📋 Позиции|📸 График|⏻ Терминал)$"),
         auth(m5_menu_text)))
+
+    # Last-resort text handler (registered LAST, same group — buttons and
+    # commands above win). An unrecognized message used to vanish silently:
+    # a typo'd or unknown command ("/help" with a leading space, "/stat")
+    # matched no handler, and the owner saw "nothing happens". Now every
+    # unmatched text gets a short hint instead of silence.
+    async def m5_fallback(update, context) -> None:
+        txt = (update.effective_message.text or "").strip()
+        if txt.startswith("/"):
+            await _reply(update, f"Не знаю команду {txt.split()[0]} — этот бот "
+                                 "про терминал MT5. Справка: /help")
+        else:
+            await _reply(update, "Не понял сообщение — кнопки внизу чата, "
+                                 "пульт /mt5, справка /help")
+    app.add_handler(MessageHandler(filters.TEXT, auth(m5_fallback)))
 
     log.info("MT5 bot starting. Terminal: %s. Allowed users: %s. Trading: %s",
              cfg.terminal_path or "(any)", cfg.allowed_user_ids, cfg.allow_trading)

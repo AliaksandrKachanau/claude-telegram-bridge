@@ -78,7 +78,7 @@ projects:
 # phase 2 behind allow_trading.
 mt5:
   terminal_path: "C:\\Program Files\\BOSSAFX 5\\terminal64.exe"  # attach to this one
-  allow_trading: false        # phase 2; trading commands stay disabled while false
+  allow_trading: true        # phase 2; trading commands stay disabled while false
   poll_sec: 2
   margin_warn_pct: 200        # warn once below, re-arm above +50 (hysteresis)
   notify: { placement: true, fill: true, close: true, cancel: false }
